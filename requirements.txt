@@ -4,8 +4,8 @@
 # System dependencies (install with apt, not pip):
 #   sudo apt-get install ffmpeg sox libsndfile1 libsox-fmt-mp3
 #
-# CUDA note: If your driver is CUDA 12.4 or older, pin numba < 0.60
-#            to avoid PTX version mismatch errors during RNNT loss computation.
+# CUDA note: Training is Linux/NVIDIA-only. Numba's CUDA target is now shipped
+#            separately as numba-cuda; use its CUDA 12 dependency set below.
 # =============================================================================
 
 # --- Core ML / Hugging Face audio decoding ---
@@ -22,8 +22,8 @@ nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main
 # --- Explicit dependency for automatic custom-language BPE generation ---
 sentencepiece>=0.2.0
 
-# --- Numba (pin for CUDA 12.4 driver compatibility — remove pin if driver >= 12.6) ---
-numba
+# --- NVIDIA Numba CUDA target used by NeMo's RNNT kernels ---
+numba-cuda[cu12] ; platform_system == "Linux"
 
 # --- Hugging Face Hub (for downloading pretrained models) ---
 huggingface-hub

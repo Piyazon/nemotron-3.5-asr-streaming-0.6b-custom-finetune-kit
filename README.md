@@ -294,7 +294,7 @@ finetune-kit/
 | Problem | Fix |
 |---------|-----|
 | `CUDA out of memory` | Reduce `batch_duration` in the script (e.g., 100 → 50) |
-| `PTX version mismatch` during RNNT loss | Pin `numba<0.60` for CUDA driver ≤ 12.4: `pip install "numba<0.60"` |
+| Numba CUDA compile error during RNNT loss | Install the CUDA 12 target from the requirements: `pip install --upgrade "numba-cuda[cu12]"` |
 | `Pretrained model not found` | Run the download command in [Quick Start](#quick-start) step 2 |
 | `No transcript.csv in pX, skipping` | Each speaker dir needs a `transcript.csv` (pipe-delimited, no header) |
 | `Converted file pX_Y.wav not found` | Filenames in `transcript.csv` must match actual files; run `--convert-only` first |
