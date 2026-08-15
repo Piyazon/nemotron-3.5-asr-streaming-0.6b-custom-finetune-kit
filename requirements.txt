@@ -9,7 +9,9 @@
 # =============================================================================
 
 # --- Core ML ---
-torch==2.5.*
+# NeMo main currently requires PyTorch 2.6 or newer. Keep this aligned with
+# NeMo instead of pinning the incompatible 2.5 release.
+torch>=2.6.0,<3.0
 
 # --- NeMo ASR (installs warprnnt, lhotse, sentencepiece, hydra, omegaconf, etc.) ---
 nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main
