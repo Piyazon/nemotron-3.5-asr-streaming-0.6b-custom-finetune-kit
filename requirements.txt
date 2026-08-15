@@ -1,0 +1,34 @@
+# =============================================================================
+# Nemotron 3.5 ASR Fine-Tuning — Requirements
+# =============================================================================
+# System dependencies (install with apt, not pip):
+#   sudo apt-get install ffmpeg sox libsndfile1 libsox-fmt-mp3
+#
+# CUDA note: If your driver is CUDA 12.4 or older, pin numba < 0.60
+#            to avoid PTX version mismatch errors during RNNT loss computation.
+# =============================================================================
+
+# --- Core ML ---
+torch==2.5.*
+
+# --- NeMo ASR (installs warprnnt, lhotse, sentencepiece, hydra, omegaconf, etc.) ---
+nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main
+
+# --- Explicit dependency for automatic custom-language BPE generation ---
+sentencepiece>=0.2.0
+
+# --- Numba (pin for CUDA 12.4 driver compatibility — remove pin if driver >= 12.6) ---
+numba
+
+# --- Hugging Face Hub (for downloading pretrained models) ---
+huggingface-hub
+
+# --- Audio / Data helpers ---
+librosa
+soundfile
+
+# --- Utilities ---
+Cython
+matplotlib
+text-unidecode
+wget
