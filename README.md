@@ -147,7 +147,7 @@ python asr_finetune_with_speechhints.py --epochs 50 --lr 0.00005
 | `--lr` | 0.1 | Learning rate (AdamW) |
 | `--language` | `en-US` for new manifests | Locale used in manifests and prompt conditioning, e.g. `ug-CN` |
 | `--tokenizer-mode` | `auto` | Choose `auto`, `base`, or `custom` |
-| `--tokenizer-vocab-size` | 1024 | Requested generated BPE size (minimum 512) |
+| `--tokenizer-vocab-size` | 2048 | Requested generated BPE size (minimum 512) |
 | `--prompt-index` | first unused | Optional explicit unused prompt slot |
 
 Tokenizer modes:

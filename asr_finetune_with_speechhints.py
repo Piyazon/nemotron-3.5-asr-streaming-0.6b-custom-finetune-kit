@@ -60,7 +60,7 @@ CONVERTED_WAVS_DIR = os.path.join(CUSTOM_DATA_DIR, "wavs")
 TOKENIZER_ROOT_DIR = os.path.join(CUSTOM_DATA_DIR, "tokenizers")
 
 DEFAULT_LANGUAGE = "en-US"
-DEFAULT_TOKENIZER_VOCAB_SIZE = 1024
+DEFAULT_TOKENIZER_VOCAB_SIZE = 2048
 
 # Pretrained model from HuggingFace
 PRETRAINED_MODEL = os.path.join(
