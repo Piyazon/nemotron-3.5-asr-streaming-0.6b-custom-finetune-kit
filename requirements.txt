@@ -8,11 +8,13 @@
 #            to avoid PTX version mismatch errors during RNNT loss computation.
 # =============================================================================
 
-# --- Core ML ---
-# NeMo main requires PyTorch 2.6 or newer. TorchCodec has a release-specific
-# PyTorch ABI, so keep these on the officially compatible 2.6 / 0.2 pair.
-torch==2.6.*
-torchcodec==0.2.*
+# --- Core ML / Hugging Face audio decoding ---
+# Hugging Face Datasets 4.4+ decodes Audio columns through TorchCodec's
+# AudioDecoder API. TorchCodec has a release-specific PyTorch ABI, so keep
+# these on the officially compatible PyTorch 2.8 / TorchCodec 0.7 pair.
+torch==2.8.*
+torchcodec==0.7.*
+datasets[audio]>=4.4.0,<5.0
 
 # --- NeMo ASR (installs warprnnt, lhotse, sentencepiece, hydra, omegaconf, etc.) ---
 nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main
