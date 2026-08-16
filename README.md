@@ -76,26 +76,11 @@ python asr_finetune_with_speechhints.py \
   --train-only \
   --language ug-CN \
   --tokenizer-mode custom \
-  --run-name uyghur-long-v2
+  --run-name uyghur-v2
 ```
 
 The preparation script uses the dataset's `sentence` column and `ug-CN`
-language prompt. By default it also adds deterministic 30–55 second examples
-made by concatenating clips within each already-separated train/test split.
-This gives the newly initialized RNNT decoder long-sequence experience and
-makes validation capable of detecting the kind of middle deletion that can be
-hidden by short-clip WER.
-
-If the short-clip manifests and audio were already prepared, avoid decoding the
-Hugging Face dataset again:
-
-```bash
-python prepare_hf_uyghur_fast.py --long-form-only --format flac
-```
-
-This reuses the existing manifest audio, writes only the additional long-form
-files, and safely merges them into `train_manifest.json` and
-`test_manifest.json`.
+language prompt and exports the original dataset clips without concatenation.
 
 ---
 
@@ -352,7 +337,6 @@ finetune-kit/
 | `--language ... does not match manifest language` | Rebuild with `--manifest-only --language <locale>`, or use the locale already stored in the manifests |
 | No free prompt slot | Omit a conflicting `--prompt-index`; automatic allocation uses the first unused slot |
 | Poor new-language output after a short run | A custom vocabulary resets the RNNT decoder/joint; add more clean transcribed speech and validate on held-out data |
-| Long stream loses speech in the middle | Re-prepare with the default long-form augmentation and retrain from the pretrained base checkpoint. Check that both manifests report long-form samples at training startup. |
 | Bench scripts: `conversion script not found` | Set `CONVERT_SCRIPT` envvar to point to your CrispASR conversion script |
 
 ## Reference

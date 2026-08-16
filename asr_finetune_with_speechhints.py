@@ -68,7 +68,6 @@ DEFAULT_VALIDATION_WORKERS = 8
 DEFAULT_VALIDATION_BATCH_SIZE = 4
 DEFAULT_WARMUP_STEPS = 100
 DEFAULT_NOAM_D_MODEL = 1024
-LONG_FORM_THRESHOLD = 30.0
 
 # Pretrained model from HuggingFace
 PRETRAINED_MODEL = os.path.join(
@@ -250,9 +249,6 @@ def manifest_duration_summary(manifest_path: str) -> dict[str, float | int]:
         "samples": len(durations),
         "hours": sum(durations) / 3600.0,
         "maximum": max(durations),
-        "long_samples": sum(
-            duration >= LONG_FORM_THRESHOLD for duration in durations
-        ),
     }
 
 
@@ -578,14 +574,12 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     log(
         "Training manifest: "
         f"{train_summary['samples']:,} samples, {train_summary['hours']:.2f} h, "
-        f"max={train_summary['maximum']:.2f}s, "
-        f"long-form (>={LONG_FORM_THRESHOLD:.0f}s)={train_summary['long_samples']:,}"
+        f"max={train_summary['maximum']:.2f}s"
     )
     log(
         "Validation manifest: "
         f"{validation_summary['samples']:,} samples, "
-        f"max={validation_summary['maximum']:.2f}s, "
-        f"long-form (>={LONG_FORM_THRESHOLD:.0f}s)={validation_summary['long_samples']:,}"
+        f"max={validation_summary['maximum']:.2f}s"
     )
     log(
         "RTX 5090 data profile: "
@@ -603,18 +597,6 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
             f"Validation entries longer than --max-duration={max_duration:g}s "
             "will be filtered by the data loader."
         )
-    if train_summary["long_samples"] == 0:
-        warn(
-            "No long-form training examples were found. For a streaming model, "
-            "prepare data with prepare_hf_uyghur_fast.py so the RNNT decoder "
-            "learns to remain stable across long utterances."
-        )
-    if validation_summary["long_samples"] == 0:
-        warn(
-            "Validation contains no long-form examples, so val_wer will not "
-            "detect long-stream deletion failures."
-        )
-
     if not os.path.exists(PRETRAINED_MODEL):
         print(f"\n[ERROR] Pretrained model not found: {PRETRAINED_MODEL}")
         print("Download with:")
@@ -775,8 +757,7 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     model.cfg.validation_ds.is_tarred = False
     model.cfg.validation_ds.num_workers = validation_workers
     model.cfg.validation_ds.pin_memory = True
-    # Four long clips are about 220 seconds, matching the 5090-oriented
-    # dynamic training budget while validation avoids gradient storage.
+    # Validation avoids gradient storage, so a larger batch remains practical.
     model.cfg.validation_ds.batch_size = validation_batch_size
     model.cfg.validation_ds.max_duration = max_duration
     model.cfg.validation_ds.initialize_prompt_feature = True
@@ -792,7 +773,7 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     # without guessing which generated tokenizer was used.
     with open_dict(model.cfg):
         # Checkpoint selection monitors val_wer, so skip the memory-intensive
-        # RNNT validation loss for long examples.
+        # RNNT validation loss for the larger validation batch.
         model.cfg.compute_eval_loss = False
         model.cfg.custom_finetune = OmegaConf.create(
             {
@@ -1258,7 +1239,7 @@ def main():
         default=None,
         help=(
             "Optional safe subdirectory under the checkpoint directory, for "
-            "example uyghur-long-v2; prevents mixing a retrain with old files"
+            "example uyghur-v2; prevents mixing a retrain with old files"
         ),
     )
     args = parser.parse_args()
