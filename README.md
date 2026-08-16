@@ -168,7 +168,7 @@ steps), the effective peak learning rate is approximately `3.1e-4`.
 | `--lr` | 0.1 | Noam learning-rate scale factor (not raw AdamW LR) |
 | `--warmup-steps` | 100 | Noam linear warmup steps |
 | `--noam-d-model` | 1024 | Model dimension used by Noam scaling |
-| `--max-duration` | 60 | Maximum train/validation clip duration in seconds |
+| `--max-duration` | 40 | Maximum train/validation clip duration in seconds |
 | `--batch-duration` | 240 | Approximate audio seconds per dynamic training batch; tuned for RTX 5090 32 GB |
 | `--train-workers` | 8 | Training data-loader processes |
 | `--validation-workers` | 8 | Validation data-loader processes |
@@ -230,7 +230,7 @@ for all original languages.
 | Optimizer | AdamW + Noam (scale=0.1, d_model=1024, warmup=100, weight_decay=0.001) |
 | Precision | BF16 mixed |
 | Gradient clipping | 5.0 |
-| Max clip duration | 60s |
+| Max clip duration | 40s |
 | Batch duration | 240s (RTX 5090 32 GB profile) |
 | Data loading | 8 workers and pinned host memory |
 | Validation | Batch size 4; WER decoding only (RNNT validation loss disabled) |
