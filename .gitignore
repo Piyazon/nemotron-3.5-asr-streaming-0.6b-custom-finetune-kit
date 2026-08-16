@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+checkpoints/
+custom_asr_data/
+pretrained_model/
+
