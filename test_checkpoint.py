@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transcribe one audio file with the newest retained fine-tuning checkpoint.
+"""Transcribe test_files/ audio with the newest retained checkpoint.
 
 This reconstructs the custom tokenizer and language prompt before loading the
 Lightning checkpoint.  Loading the checkpoint directly into the untouched base
@@ -8,8 +8,9 @@ joint vocabulary dimensions.
 
 Run on the Linux training server, for example:
 
+    python test_checkpoint.py
     python test_checkpoint.py sample2.mp3
-    python test_checkpoint.py sample2.mp3 --device cuda
+    python test_checkpoint.py --device cuda
     python test_checkpoint.py sample2.mp3 --checkpoint /path/to/model.ckpt
 """
 
@@ -29,10 +30,6 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
 
-# AUDIO_FILE = "ref_arhip.wav"
-# AUDIO_FILE = "sultan_20251224_0012_22050hz_1ch_segment_008.wav"
-
-AUDIO_FILE = "sample2.mp3"
 CHECKPOINT: str | None = None
 TOKENIZER_DIR: str | None = None
 
@@ -53,6 +50,17 @@ CHECKPOINT_DIR = (
     / "test"
 )
 TOKENIZER_ROOT_DIR = ROOT_DIR / "custom_asr_data" / "tokenizers"
+TEST_FILES_DIR = ROOT_DIR / "test_files"
+SUPPORTED_AUDIO_SUFFIXES = {
+    ".aac",
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".wma",
+}
 
 
 def resolve_path(path: str | Path) -> Path:
@@ -61,6 +69,45 @@ def resolve_path(path: str | Path) -> Path:
     if not resolved.is_absolute():
         resolved = Path.cwd() / resolved
     return resolved.resolve()
+
+
+def find_audio_files(audio: str | None) -> list[Path]:
+    """Resolve one requested file or discover all audio under test_files/."""
+    if audio:
+        requested = Path(audio).expanduser()
+        if requested.is_absolute():
+            audio_path = requested.resolve()
+        else:
+            test_files_candidate = TEST_FILES_DIR / requested
+            audio_path = (
+                test_files_candidate.resolve()
+                if test_files_candidate.exists()
+                else resolve_path(requested)
+            )
+
+        if not audio_path.is_file():
+            raise FileNotFoundError(
+                f"Audio file not found directly or under {TEST_FILES_DIR}: {audio}"
+            )
+        if audio_path.suffix.lower() not in SUPPORTED_AUDIO_SUFFIXES:
+            raise ValueError(f"Unsupported audio extension: {audio_path.suffix}")
+        return [audio_path]
+
+    if not TEST_FILES_DIR.is_dir():
+        raise FileNotFoundError(f"Test-audio directory not found: {TEST_FILES_DIR}")
+
+    audio_files = sorted(
+        path.resolve()
+        for path in TEST_FILES_DIR.rglob("*")
+        if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_SUFFIXES
+    )
+    if not audio_files:
+        supported = ", ".join(sorted(SUPPORTED_AUDIO_SUFFIXES))
+        raise FileNotFoundError(
+            f"No supported audio files found under {TEST_FILES_DIR}. "
+            f"Supported extensions: {supported}"
+        )
+    return audio_files
 
 
 def find_latest_checkpoint() -> Path:
@@ -186,13 +233,16 @@ def configure_language_prompt(model, language: str, requested_index: int | None)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Transcribe one audio file with the latest custom-language checkpoint."
+        description="Transcribe test_files/ audio with the latest custom-language checkpoint."
     )
     parser.add_argument(
         "audio",
         nargs="?",
-        default=AUDIO_FILE,
-        help=f"WAV/MP3/FLAC file to transcribe (default: {AUDIO_FILE})",
+        default=None,
+        help=(
+            "One audio path or filename under test_files/; when omitted, "
+            "transcribe every supported file under test_files/"
+        ),
     )
     parser.add_argument(
         "--checkpoint",
@@ -234,7 +284,7 @@ def main() -> None:
     import torch
     from nemo.collections.asr.models import EncDecRNNTBPEModelWithPrompt
 
-    audio_path = resolve_path(args.audio)
+    audio_paths = find_audio_files(args.audio)
     checkpoint_path = (
         resolve_path(args.checkpoint) if args.checkpoint else find_latest_checkpoint()
     )
@@ -245,7 +295,6 @@ def main() -> None:
     )
 
     for label, path in (
-        ("Audio", audio_path),
         ("Base model", BASE_MODEL),
         ("Checkpoint", checkpoint_path),
         ("Tokenizer", tokenizer_path),
@@ -260,7 +309,9 @@ def main() -> None:
     print("=" * 80)
     print("Nemotron 3.5 custom-language checkpoint transcription")
     print("=" * 80)
-    print(f"Audio      : {audio_path}")
+    print(f"Audio files: {len(audio_paths)}")
+    for audio_path in audio_paths:
+        print(f"             {audio_path}")
     print(f"Checkpoint : {checkpoint_path}")
     print(f"Tokenizer  : {tokenizer_path}")
     print(f"Language   : {args.language}")
@@ -318,44 +369,47 @@ def main() -> None:
     model = model.to(device)
     model.eval()
 
-    print("\nLoading and resampling audio to mono 16 kHz...")
-    waveform, _ = librosa.load(str(audio_path), sr=16000, mono=True)
-    if waveform.size == 0:
-        raise ValueError(f"Audio file is empty: {audio_path}")
-
-    duration = waveform.shape[0] / 16000
-    print(f"Duration               : {duration:.2f} seconds")
-
-    audio = torch.from_numpy(waveform).float().unsqueeze(0).to(device)
-    audio_length = torch.tensor([audio.shape[1]], dtype=torch.long, device=device)
     prompt_indices = torch.tensor([prompt_id], dtype=torch.long, device=device)
 
-    print("\nTranscribing...\n")
-    with torch.inference_mode():
-        encoder_output, encoded_lengths = model(
-            input_signal=audio,
-            input_signal_length=audio_length,
-            prompt_indices=prompt_indices,
-        )
-        decoded = model.decoding.rnnt_decoder_predictions_tensor(
-            encoder_output=encoder_output,
-            encoded_lengths=encoded_lengths,
-            return_hypotheses=True,
-        )
+    for file_number, audio_path in enumerate(audio_paths, start=1):
+        print(f"\n[{file_number}/{len(audio_paths)}] Loading: {audio_path}")
+        waveform, _ = librosa.load(str(audio_path), sr=16000, mono=True)
+        if waveform.size == 0:
+            print("Skipping empty audio file.")
+            continue
 
-    # Some NeMo versions return (best_hypotheses, all_hypotheses).
-    hypotheses = decoded[0] if isinstance(decoded, tuple) else decoded
-    if not hypotheses:
-        transcription = ""
-    else:
-        hypothesis = hypotheses[0]
-        transcription = hypothesis.text if hasattr(hypothesis, "text") else str(hypothesis)
+        duration = waveform.shape[0] / 16000
+        print(f"Duration: {duration:.2f} seconds")
 
-    print("=" * 80)
-    print("TRANSCRIPTION")
-    print("=" * 80)
-    print(transcription)
-    print("=" * 80)
+        audio = torch.from_numpy(waveform).float().unsqueeze(0).to(device)
+        audio_length = torch.tensor([audio.shape[1]], dtype=torch.long, device=device)
+
+        print("Transcribing...")
+        with torch.inference_mode():
+            encoder_output, encoded_lengths = model(
+                input_signal=audio,
+                input_signal_length=audio_length,
+                prompt_indices=prompt_indices,
+            )
+            decoded = model.decoding.rnnt_decoder_predictions_tensor(
+                encoder_output=encoder_output,
+                encoded_lengths=encoded_lengths,
+                return_hypotheses=True,
+            )
+
+        # Some NeMo versions return (best_hypotheses, all_hypotheses).
+        hypotheses = decoded[0] if isinstance(decoded, tuple) else decoded
+        if not hypotheses:
+            transcription = ""
+        else:
+            hypothesis = hypotheses[0]
+            transcription = hypothesis.text if hasattr(hypothesis, "text") else str(hypothesis)
+
+        print("-" * 80)
+        print(f"TRANSCRIPTION: {audio_path.name}")
+        print("-" * 80)
+        print(transcription)
+        print("=" * 80)
 
 
 if __name__ == "__main__":

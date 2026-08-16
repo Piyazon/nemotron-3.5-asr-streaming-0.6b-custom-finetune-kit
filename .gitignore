@@ -221,3 +221,4 @@ checkpoints/
 custom_asr_data/
 pretrained_model/
 
+test_files/
