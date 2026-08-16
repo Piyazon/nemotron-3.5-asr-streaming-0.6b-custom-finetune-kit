@@ -116,19 +116,21 @@ def find_latest_checkpoint() -> Path:
     The epoch checkpoint is preferred over ``last.ckpt`` because ``last.ckpt``
     may be replaced while a concurrent training process finishes an epoch.
     """
-    epoch_checkpoints = list(CHECKPOINT_DIR.glob("nemotron-asr-finetuned-epoch=*.ckpt"))
+    epoch_checkpoints = list(
+        CHECKPOINT_DIR.rglob("nemotron-asr-finetuned-epoch=*.ckpt")
+    )
 
     if epoch_checkpoints:
         def checkpoint_order(path: Path) -> tuple[int, int]:
             match = re.search(r"epoch=(\d+)", path.name)
             epoch = int(match.group(1)) if match else -1
-            return epoch, path.stat().st_mtime_ns
+            return path.stat().st_mtime_ns, epoch
 
         return max(epoch_checkpoints, key=checkpoint_order)
 
-    last_checkpoint = CHECKPOINT_DIR / "last.ckpt"
-    if last_checkpoint.is_file():
-        return last_checkpoint
+    last_checkpoints = list(CHECKPOINT_DIR.rglob("last.ckpt"))
+    if last_checkpoints:
+        return max(last_checkpoints, key=lambda path: path.stat().st_mtime_ns)
 
     raise FileNotFoundError(f"No .ckpt files found in: {CHECKPOINT_DIR}")
 
@@ -178,6 +180,28 @@ def prompt_index_from_checkpoint(checkpoint: dict, language: str) -> int | None:
             value = None
         if value is not None:
             return int(value)
+
+    return None
+
+
+def tokenizer_dir_from_checkpoint(checkpoint: dict) -> Path | None:
+    """Read the exact generated tokenizer path recorded during training."""
+    from omegaconf import OmegaConf
+
+    hyper_parameters = checkpoint.get("hyper_parameters", {})
+    if not isinstance(hyper_parameters, dict):
+        return None
+
+    for key in ("cfg", "model_cfg"):
+        cfg = hyper_parameters.get(key)
+        if cfg is None:
+            continue
+        try:
+            value = OmegaConf.select(cfg, "custom_finetune.tokenizer_dir")
+        except (AttributeError, TypeError, ValueError):
+            value = None
+        if value:
+            return resolve_path(str(value))
 
     return None
 
@@ -252,7 +276,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tokenizer-dir",
         default=TOKENIZER_DIR,
-        help="Generated tokenizer directory; default: newest tokenizer for --language",
+        help=(
+            "Generated tokenizer directory; default: exact path recorded in the "
+            "checkpoint, with newest-tokenizer fallback for older checkpoints"
+        ),
     )
     parser.add_argument("--language", default=LANGUAGE, help=f"Language locale (default: {LANGUAGE})")
     parser.add_argument(
@@ -288,16 +315,10 @@ def main() -> None:
     checkpoint_path = (
         resolve_path(args.checkpoint) if args.checkpoint else find_latest_checkpoint()
     )
-    tokenizer_path = (
-        resolve_path(args.tokenizer_dir)
-        if args.tokenizer_dir
-        else find_latest_tokenizer(args.language)
-    )
 
     for label, path in (
         ("Base model", BASE_MODEL),
         ("Checkpoint", checkpoint_path),
-        ("Tokenizer", tokenizer_path),
     ):
         if not path.exists():
             raise FileNotFoundError(f"{label} not found: {path}")
@@ -305,6 +326,28 @@ def main() -> None:
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device cuda was requested, but CUDA is not available.")
     device = torch.device(args.device)
+
+    print("Reading checkpoint metadata and weights...")
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+        mmap=True,
+    )
+    recorded_tokenizer_path = tokenizer_dir_from_checkpoint(checkpoint)
+    if args.tokenizer_dir:
+        tokenizer_path = resolve_path(args.tokenizer_dir)
+    elif recorded_tokenizer_path is not None:
+        tokenizer_path = recorded_tokenizer_path
+        print(f"Using tokenizer recorded in checkpoint: {tokenizer_path}")
+    else:
+        tokenizer_path = find_latest_tokenizer(args.language)
+        print(
+            "WARNING: this older checkpoint has no tokenizer provenance; "
+            f"falling back to newest complete tokenizer: {tokenizer_path}"
+        )
+    if not tokenizer_path.exists():
+        raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
 
     print("=" * 80)
     print("Nemotron 3.5 custom-language checkpoint transcription")
@@ -316,14 +359,6 @@ def main() -> None:
     print(f"Tokenizer  : {tokenizer_path}")
     print(f"Language   : {args.language}")
     print(f"Device     : {device}")
-
-    print("\nReading checkpoint metadata and weights...")
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=False,
-        mmap=True,
-    )
     print(f"Checkpoint epoch       : {checkpoint.get('epoch', 'unknown')}")
     print(f"Checkpoint global step : {checkpoint.get('global_step', 'unknown')}")
 

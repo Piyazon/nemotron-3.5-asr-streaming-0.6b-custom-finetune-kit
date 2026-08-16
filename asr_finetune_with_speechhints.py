@@ -61,6 +61,14 @@ TOKENIZER_ROOT_DIR = os.path.join(CUSTOM_DATA_DIR, "tokenizers")
 
 DEFAULT_LANGUAGE = "en-US"
 DEFAULT_TOKENIZER_VOCAB_SIZE = 2048
+DEFAULT_MAX_DURATION = 60.0
+DEFAULT_BATCH_DURATION = 240.0
+DEFAULT_TRAIN_WORKERS = 8
+DEFAULT_VALIDATION_WORKERS = 8
+DEFAULT_VALIDATION_BATCH_SIZE = 4
+DEFAULT_WARMUP_STEPS = 100
+DEFAULT_NOAM_D_MODEL = 1024
+LONG_FORM_THRESHOLD = 30.0
 
 # Pretrained model from HuggingFace
 PRETRAINED_MODEL = os.path.join(
@@ -219,6 +227,33 @@ def tokenizer_unknown_rate(tokenizer, texts: list[str]) -> tuple[int, int, float
         unknown += sum(token_id == unk_id for token_id in token_ids)
     rate = unknown / total if total else 0.0
     return unknown, total, rate
+
+
+def manifest_duration_summary(manifest_path: str) -> dict[str, float | int]:
+    """Summarize duration coverage without decoding any audio."""
+    entries = read_manifest_entries(manifest_path)
+    durations = []
+    for line_num, entry in enumerate(entries, 1):
+        try:
+            duration = float(entry["duration"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid duration in {manifest_path} at entry {line_num}"
+            ) from exc
+        if duration <= 0:
+            raise ValueError(
+                f"Duration must be positive in {manifest_path} at entry {line_num}"
+            )
+        durations.append(duration)
+
+    return {
+        "samples": len(durations),
+        "hours": sum(durations) / 3600.0,
+        "maximum": max(durations),
+        "long_samples": sum(
+            duration >= LONG_FORM_THRESHOLD for duration in durations
+        ),
+    }
 
 
 def build_custom_tokenizer(
@@ -491,7 +526,15 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
                  lr: float = 0.1, language: str = DEFAULT_LANGUAGE,
                  tokenizer_mode: str = "auto",
                  tokenizer_vocab_size: int = DEFAULT_TOKENIZER_VOCAB_SIZE,
-                 prompt_index: int | None = None):
+                 prompt_index: int | None = None,
+                 max_duration: float = DEFAULT_MAX_DURATION,
+                 batch_duration: float = DEFAULT_BATCH_DURATION,
+                 warmup_steps: int = DEFAULT_WARMUP_STEPS,
+                 noam_d_model: int = DEFAULT_NOAM_D_MODEL,
+                 run_name: str | None = None,
+                 train_workers: int = DEFAULT_TRAIN_WORKERS,
+                 validation_workers: int = DEFAULT_VALIDATION_WORKERS,
+                 validation_batch_size: int = DEFAULT_VALIDATION_BATCH_SIZE):
     """Fine-tune the pretrained model using NeMo's Python API directly.
 
     Loads EncDecRNNTBPEModelWithPrompt from the .nemo file, updates data
@@ -505,8 +548,72 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         raise ValueError(
             "tokenizer_mode must be one of: 'auto', 'base', or 'custom'"
         )
+    if lr <= 0:
+        raise ValueError("--lr must be positive")
+    if max_duration <= 0 or batch_duration <= 0:
+        raise ValueError("--max-duration and --batch-duration must be positive")
+    if warmup_steps <= 0:
+        raise ValueError("--warmup-steps must be positive for the Noam scheduler")
+    if noam_d_model <= 0:
+        raise ValueError("--noam-d-model must be positive")
+    if train_workers < 0 or validation_workers < 0:
+        raise ValueError("Data-loader worker counts cannot be negative")
+    if validation_batch_size <= 0:
+        raise ValueError("--validation-batch-size must be positive")
+    if run_name is not None:
+        run_name = run_name.strip()
+        if not run_name or not re.fullmatch(r"[A-Za-z0-9_.-]+", run_name):
+            raise ValueError(
+                "--run-name may contain only letters, digits, dot, underscore, and dash"
+            )
+    checkpoint_dir = (
+        os.path.join(CHECKPOINT_DIR, run_name) if run_name else CHECKPOINT_DIR
+    )
+    os.makedirs(checkpoint_dir, exist_ok=True)
     resolve_manifest_language(train_manifest, requested=language)
     resolve_manifest_language(test_manifest, requested=language)
+
+    train_summary = manifest_duration_summary(train_manifest)
+    validation_summary = manifest_duration_summary(test_manifest)
+    log(
+        "Training manifest: "
+        f"{train_summary['samples']:,} samples, {train_summary['hours']:.2f} h, "
+        f"max={train_summary['maximum']:.2f}s, "
+        f"long-form (>={LONG_FORM_THRESHOLD:.0f}s)={train_summary['long_samples']:,}"
+    )
+    log(
+        "Validation manifest: "
+        f"{validation_summary['samples']:,} samples, "
+        f"max={validation_summary['maximum']:.2f}s, "
+        f"long-form (>={LONG_FORM_THRESHOLD:.0f}s)={validation_summary['long_samples']:,}"
+    )
+    log(
+        "RTX 5090 data profile: "
+        f"batch_duration={batch_duration:g}s, train_workers={train_workers}, "
+        f"validation_batch_size={validation_batch_size}, "
+        f"validation_workers={validation_workers}, pinned_memory=True"
+    )
+    if train_summary["maximum"] > max_duration:
+        warn(
+            f"Training entries longer than --max-duration={max_duration:g}s will "
+            "be filtered by the data loader."
+        )
+    if validation_summary["maximum"] > max_duration:
+        warn(
+            f"Validation entries longer than --max-duration={max_duration:g}s "
+            "will be filtered by the data loader."
+        )
+    if train_summary["long_samples"] == 0:
+        warn(
+            "No long-form training examples were found. For a streaming model, "
+            "prepare data with prepare_hf_uyghur_fast.py so the RNNT decoder "
+            "learns to remain stable across long utterances."
+        )
+    if validation_summary["long_samples"] == 0:
+        warn(
+            "Validation contains no long-form examples, so val_wer will not "
+            "detect long-stream deletion failures."
+        )
 
     if not os.path.exists(PRETRAINED_MODEL):
         print(f"\n[ERROR] Pretrained model not found: {PRETRAINED_MODEL}")
@@ -588,11 +695,13 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
             "Installed generated tokenizer. NeMo reinitialized the RNNT "
             "decoder/joint for the new vocabulary; the acoustic encoder was retained."
         )
+        active_tokenizer_dir = os.path.abspath(tokenizer_dir)
     else:
         log(
             "Keeping the pretrained tokenizer "
             f"(--tokenizer-mode={tokenizer_mode}, language already representable)."
         )
+        active_tokenizer_dir = None
 
     num_prompts = int(
         model.cfg.get(
@@ -649,9 +758,10 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     model.cfg.train_ds.manifest_filepath = train_manifest
     model.cfg.train_ds.is_tarred = False
     model.cfg.train_ds.shuffle = True
-    model.cfg.train_ds.num_workers = 4
-    model.cfg.train_ds.max_duration = 40      # default=20 drops clips >20s; raise to use all data
-    model.cfg.train_ds.batch_duration = 100   # smaller for our dataset
+    model.cfg.train_ds.num_workers = train_workers
+    model.cfg.train_ds.pin_memory = True
+    model.cfg.train_ds.max_duration = max_duration
+    model.cfg.train_ds.batch_duration = batch_duration
     model.cfg.train_ds.initialize_prompt_feature = True
     model.cfg.train_ds.prompt_dictionary = OmegaConf.create(prompt_dictionary)
     model.cfg.train_ds.num_prompts = num_prompts
@@ -663,8 +773,12 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     OmegaConf.set_struct(model.cfg.validation_ds, False)
     model.cfg.validation_ds.manifest_filepath = test_manifest
     model.cfg.validation_ds.is_tarred = False
-    model.cfg.validation_ds.num_workers = 2
-    model.cfg.validation_ds.batch_size = 8
+    model.cfg.validation_ds.num_workers = validation_workers
+    model.cfg.validation_ds.pin_memory = True
+    # Four long clips are about 220 seconds, matching the 5090-oriented
+    # dynamic training budget while validation avoids gradient storage.
+    model.cfg.validation_ds.batch_size = validation_batch_size
+    model.cfg.validation_ds.max_duration = max_duration
     model.cfg.validation_ds.initialize_prompt_feature = True
     model.cfg.validation_ds.prompt_dictionary = OmegaConf.create(prompt_dictionary)
     model.cfg.validation_ds.num_prompts = num_prompts
@@ -674,13 +788,44 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     OmegaConf.set_struct(model.cfg.validation_ds, True)
 
     # ------------------------------------------------------------------
-    # Update optimizer config (from notebook recommendations)
+    # Record enough provenance to reconstruct custom-vocabulary checkpoints
+    # without guessing which generated tokenizer was used.
+    with open_dict(model.cfg):
+        # Checkpoint selection monitors val_wer, so skip the memory-intensive
+        # RNNT validation loss for long examples.
+        model.cfg.compute_eval_loss = False
+        model.cfg.custom_finetune = OmegaConf.create(
+            {
+                "language": language,
+                "tokenizer_mode": tokenizer_mode,
+                "tokenizer_dir": active_tokenizer_dir,
+                "tokenizer_vocab_size": tokenizer_vocab_size,
+                "prompt_index": selected_prompt_index,
+                "train_manifest": os.path.abspath(train_manifest),
+                "validation_manifest": os.path.abspath(test_manifest),
+                "max_duration": max_duration,
+                "batch_duration": batch_duration,
+                "train_workers": train_workers,
+                "validation_workers": validation_workers,
+                "validation_batch_size": validation_batch_size,
+                "run_name": run_name,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Update optimizer config (from NVIDIA's Nemotron tutorial)
     # ------------------------------------------------------------------
     OmegaConf.set_struct(model.cfg.optim, False)
     model.cfg.optim.name = "adamw"
     model.cfg.optim.lr = lr
     model.cfg.optim.weight_decay = 0.001
-    model.cfg.optim.sched.warmup_steps = 100
+    if model.cfg.optim.get("sched") is None:
+        model.cfg.optim.sched = OmegaConf.create({})
+    OmegaConf.set_struct(model.cfg.optim.sched, False)
+    model.cfg.optim.sched.name = "NoamAnnealing"
+    model.cfg.optim.sched.warmup_steps = warmup_steps
+    model.cfg.optim.sched.d_model = noam_d_model
+    OmegaConf.set_struct(model.cfg.optim.sched, True)
     OmegaConf.set_struct(model.cfg.optim, True)
 
     # ------------------------------------------------------------------
@@ -702,37 +847,63 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         log("Validation batches: dynamic (bucketing sampler)")
 
     # ------------------------------------------------------------------
-    # Override configure_optimizers to avoid NeMo's prepare_lr_scheduler,
-    # which crashes because lhotse samplers don't expose batch_size.
-    # We build the optimizer directly from model.cfg.optim.
+    # Avoid NeMo's automatic step-count calculation, which expects a normal
+    # DataLoader.batch_size and fails with this model's dynamic Lhotse sampler.
+    # Crucially, retain NVIDIA's Noam schedule: optim.lr=0.1 is a scale factor,
+    # not a raw AdamW learning rate.
     # ------------------------------------------------------------------
     import torch as _torch
+    from nemo.core.optim.lr_scheduler import NoamAnnealing
+
+    # RTX 5090/Blackwell benefits from Tensor Core paths for any float32
+    # operations that remain around the BF16 mixed-precision training graph.
+    _torch.set_float32_matmul_precision("high")
+    if _torch.cuda.is_available():
+        _torch.backends.cuda.matmul.allow_tf32 = True
+        _torch.backends.cudnn.allow_tf32 = True
 
     def _custom_configure_optimizers(self):
         optim_cfg = self.cfg.optim
-        optimizer_cls = getattr(_torch.optim, optim_cfg.name.capitalize(), _torch.optim.AdamW)
-        optimizer = optimizer_cls(
+        betas = tuple(optim_cfg.get("betas", (0.9, 0.98)))
+        optimizer = _torch.optim.AdamW(
             self.parameters(),
-            lr=optim_cfg.lr,
-            betas=list(optim_cfg.betas) if hasattr(optim_cfg, "betas") else [0.9, 0.98],
-            weight_decay=optim_cfg.weight_decay,
+            lr=float(optim_cfg.lr),
+            betas=betas,
+            weight_decay=float(optim_cfg.weight_decay),
+        )
+        scheduler = NoamAnnealing(
+            optimizer,
+            d_model=noam_d_model,
+            warmup_steps=warmup_steps,
         )
         # NeMo expects _optimizer to be set for training_step logging
         self._optimizer = optimizer
-        log(f"Optimizer: {optim_cfg.name}, lr={optim_cfg.lr}, wd={optim_cfg.weight_decay}")
-        return optimizer
+        peak_lr = float(optim_cfg.lr) / (noam_d_model * warmup_steps) ** 0.5
+        log(
+            f"Optimizer: AdamW, Noam scale={optim_cfg.lr}, "
+            f"warmup={warmup_steps}, d_model={noam_d_model}, "
+            f"effective peak LR~{peak_lr:.3g}, wd={optim_cfg.weight_decay}"
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
 
     model.configure_optimizers = _custom_configure_optimizers.__get__(
         model, type(model)
     )
-    log("Overrode configure_optimizers (bypasses NeMo LR scheduler)")
+    log("Configured AdamW with an explicit step-wise Noam scheduler")
     log("Optimizer configured.")
 
     # ------------------------------------------------------------------
     # Training callbacks
     # ------------------------------------------------------------------
     checkpoint_cb = ModelCheckpoint(
-        dirpath=CHECKPOINT_DIR,
+        dirpath=checkpoint_dir,
         filename="nemotron-asr-finetuned-{epoch:02d}-{global_step}",
         save_top_k=3,
         monitor="val_wer",
@@ -761,12 +932,13 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         log_every_n_steps=10,
         val_check_interval=1.0,  # validate once per epoch
         enable_progress_bar=True,
+        benchmark=True,
     )
 
     # ------------------------------------------------------------------
     # Train!
     # ------------------------------------------------------------------
-    log(f"\nStarting fine-tuning ({epochs} epochs, lr={lr}) ...\n")
+    log(f"\nStarting fine-tuning ({epochs} epochs, Noam scale={lr}) ...\n")
     trainer.fit(model, train_dataloaders=train_dl, val_dataloaders=val_dl)
     # ------------------------------------------------------------------
     # Convert top-3 best checkpoints (lowest WER) to .nemo
@@ -790,7 +962,7 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         for rank, (ckpt_path, wer_val) in enumerate(sorted_best, start=1):
             wer_str = f"{wer_val:.4f}" if wer_val is not None else "wer-unknown"
             nemo_name = f"nemotron-asr-best{rank}-wer-{wer_str}.nemo"
-            nemo_path = os.path.join(CHECKPOINT_DIR, nemo_name)
+            nemo_path = os.path.join(checkpoint_dir, nemo_name)
 
             log(f"  Best #{rank} (WER={wer_str}): loading {os.path.basename(ckpt_path)} ...")
 
@@ -815,11 +987,11 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     # ------------------------------------------------------------------
     # Save final .nemo checkpoint (last epoch, regardless of WER)
     # ------------------------------------------------------------------
-    final_nemo = os.path.join(CHECKPOINT_DIR, "nemotron-asr-finetuned.nemo")
+    final_nemo = os.path.join(checkpoint_dir, "nemotron-asr-finetuned.nemo")
     model.save_to(final_nemo)
     log(f"\nTraining complete!")
     log(f"Final model saved to: {final_nemo}")
-    log(f"Best checkpoints in:  {CHECKPOINT_DIR}")
+    log(f"Best checkpoints in:  {checkpoint_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -1020,7 +1192,75 @@ def main():
     parser.add_argument("--epochs", type=int, default=20,
                         help="Max training epochs (default: 20)")
     parser.add_argument("--lr", type=float, default=0.1,
-                        help="Learning rate (default: 0.1, per notebook)")
+                        help=(
+                            "Noam learning-rate scale factor, not the raw AdamW LR "
+                            "(default: 0.1, per NVIDIA tutorial)"
+                        ))
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=DEFAULT_WARMUP_STEPS,
+        help=f"Noam linear warmup steps (default: {DEFAULT_WARMUP_STEPS})",
+    )
+    parser.add_argument(
+        "--noam-d-model",
+        type=int,
+        default=DEFAULT_NOAM_D_MODEL,
+        help=f"Noam model dimension (default: {DEFAULT_NOAM_D_MODEL})",
+    )
+    parser.add_argument(
+        "--max-duration",
+        type=float,
+        default=DEFAULT_MAX_DURATION,
+        help=(
+            "Maximum train/validation clip duration in seconds "
+            f"(default: {DEFAULT_MAX_DURATION:g})"
+        ),
+    )
+    parser.add_argument(
+        "--batch-duration",
+        type=float,
+        default=DEFAULT_BATCH_DURATION,
+        help=(
+            "Approximate total audio seconds per dynamic training batch "
+            f"(default: {DEFAULT_BATCH_DURATION:g})"
+        ),
+    )
+    parser.add_argument(
+        "--train-workers",
+        type=int,
+        default=DEFAULT_TRAIN_WORKERS,
+        help=(
+            "Training data-loader processes "
+            f"(default: {DEFAULT_TRAIN_WORKERS} for a 32 GB RTX 5090 host)"
+        ),
+    )
+    parser.add_argument(
+        "--validation-workers",
+        type=int,
+        default=DEFAULT_VALIDATION_WORKERS,
+        help=(
+            "Validation data-loader processes "
+            f"(default: {DEFAULT_VALIDATION_WORKERS})"
+        ),
+    )
+    parser.add_argument(
+        "--validation-batch-size",
+        type=int,
+        default=DEFAULT_VALIDATION_BATCH_SIZE,
+        help=(
+            "Validation clips per batch "
+            f"(default: {DEFAULT_VALIDATION_BATCH_SIZE})"
+        ),
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help=(
+            "Optional safe subdirectory under the checkpoint directory, for "
+            "example uyghur-long-v2; prevents mixing a retrain with old files"
+        ),
+    )
     args = parser.parse_args()
 
     if sys.platform == "darwin":
@@ -1059,6 +1299,14 @@ def main():
             tokenizer_mode=args.tokenizer_mode,
             tokenizer_vocab_size=args.tokenizer_vocab_size,
             prompt_index=args.prompt_index,
+            max_duration=args.max_duration,
+            batch_duration=args.batch_duration,
+            warmup_steps=args.warmup_steps,
+            noam_d_model=args.noam_d_model,
+            run_name=args.run_name,
+            train_workers=args.train_workers,
+            validation_workers=args.validation_workers,
+            validation_batch_size=args.validation_batch_size,
         )
 
         log("\n>>> Step 4: Evaluating model ...")
@@ -1098,6 +1346,14 @@ def main():
             tokenizer_mode=args.tokenizer_mode,
             tokenizer_vocab_size=args.tokenizer_vocab_size,
             prompt_index=args.prompt_index,
+            max_duration=args.max_duration,
+            batch_duration=args.batch_duration,
+            warmup_steps=args.warmup_steps,
+            noam_d_model=args.noam_d_model,
+            run_name=args.run_name,
+            train_workers=args.train_workers,
+            validation_workers=args.validation_workers,
+            validation_batch_size=args.validation_batch_size,
         )
         return
 

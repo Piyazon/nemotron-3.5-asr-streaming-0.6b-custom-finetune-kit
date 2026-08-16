@@ -64,6 +64,38 @@ With the default `--tokenizer-mode auto`, the training step:
 
 The generated tokenizer is content-addressed: rerunning with unchanged training
 text reuses it, while changed transcripts or vocabulary size produce a new one.
+The exact tokenizer directory and prompt index are also recorded in every new
+Lightning checkpoint, so checkpoint export and testing no longer have to guess
+which same-sized tokenizer belongs to a checkpoint.
+
+For the included Hugging Face Uyghur dataset, prepare and train with:
+
+```bash
+python prepare_hf_uyghur_fast.py --format flac
+python asr_finetune_with_speechhints.py \
+  --train-only \
+  --language ug-CN \
+  --tokenizer-mode custom \
+  --run-name uyghur-long-v2
+```
+
+The preparation script uses the dataset's `sentence` column and `ug-CN`
+language prompt. By default it also adds deterministic 30–55 second examples
+made by concatenating clips within each already-separated train/test split.
+This gives the newly initialized RNNT decoder long-sequence experience and
+makes validation capable of detecting the kind of middle deletion that can be
+hidden by short-clip WER.
+
+If the short-clip manifests and audio were already prepared, avoid decoding the
+Hugging Face dataset again:
+
+```bash
+python prepare_hf_uyghur_fast.py --long-form-only --format flac
+```
+
+This reuses the existing manifest audio, writes only the additional long-form
+files, and safely merges them into `train_manifest.json` and
+`test_manifest.json`.
 
 ---
 
@@ -138,13 +170,25 @@ python asr_finetune_with_speechhints.py --apply-speechhints
 Convergence depends on the language, tokenizer reset, and amount of speech data.
 
 ```bash
-python asr_finetune_with_speechhints.py --epochs 50 --lr 0.00005
+python asr_finetune_with_speechhints.py --epochs 50 --lr 0.1
 ```
+
+`--lr` has NVIDIA's Noam-scheduler meaning: it is a scale factor, not the raw
+AdamW learning rate. With the defaults (`0.1`, `d_model=1024`, 100 warmup
+steps), the effective peak learning rate is approximately `3.1e-4`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--epochs` | 20 | Maximum training epochs (for full training) |
-| `--lr` | 0.1 | Learning rate (AdamW) |
+| `--lr` | 0.1 | Noam learning-rate scale factor (not raw AdamW LR) |
+| `--warmup-steps` | 100 | Noam linear warmup steps |
+| `--noam-d-model` | 1024 | Model dimension used by Noam scaling |
+| `--max-duration` | 60 | Maximum train/validation clip duration in seconds |
+| `--batch-duration` | 240 | Approximate audio seconds per dynamic training batch; tuned for RTX 5090 32 GB |
+| `--train-workers` | 8 | Training data-loader processes |
+| `--validation-workers` | 8 | Validation data-loader processes |
+| `--validation-batch-size` | 4 | Validation clips per batch |
+| `--run-name` | none | Optional checkpoint subdirectory to keep retrains separate |
 | `--language` | `en-US` for new manifests | Locale used in manifests and prompt conditioning, e.g. `ug-CN` |
 | `--tokenizer-mode` | `auto` | Choose `auto`, `base`, or `custom` |
 | `--tokenizer-vocab-size` | 2048 | Requested generated BPE size (minimum 512) |
@@ -198,11 +242,18 @@ for all original languages.
 
 | Setting | Value |
 |---------|-------|
-| Optimizer | AdamW (lr=0.1, weight_decay=0.001) |
+| Optimizer | AdamW + Noam (scale=0.1, d_model=1024, warmup=100, weight_decay=0.001) |
 | Precision | BF16 mixed |
 | Gradient clipping | 5.0 |
-| Max clip duration | 40s |
-| Batch duration | 100s |
+| Max clip duration | 60s |
+| Batch duration | 240s (RTX 5090 32 GB profile) |
+| Data loading | 8 workers and pinned host memory |
+| Validation | Batch size 4; WER decoding only (RNNT validation loss disabled) |
+
+The explicit Noam scheduler is important. The model uses a dynamic Lhotse
+sampler, so this kit bypasses NeMo's automatic step-count calculation, but it
+does not bypass LR scheduling. Feeding raw `0.1` directly to AdamW is incorrect
+for this recipe.
 
 **Saved checkpoints:**
 
@@ -293,7 +344,7 @@ finetune-kit/
 
 | Problem | Fix |
 |---------|-----|
-| `CUDA out of memory` | Reduce `batch_duration` in the script (e.g., 100 → 50) |
+| `CUDA out of memory` | Reduce `--batch-duration` from 240 to 200 or 160; unusually long transcripts can use more RNNT memory even at the same audio duration |
 | Numba CUDA compile error during RNNT loss | Reinstall the compatible CUDA target and NumPy constraint: `pip install --upgrade --force-reinstall "numpy>=1.26,<2.5" "numba-cuda[cu12]"` |
 | `Pretrained model not found` | Run the download command in [Quick Start](#quick-start) step 2 |
 | `No transcript.csv in pX, skipping` | Each speaker dir needs a `transcript.csv` (pipe-delimited, no header) |
@@ -301,6 +352,7 @@ finetune-kit/
 | `--language ... does not match manifest language` | Rebuild with `--manifest-only --language <locale>`, or use the locale already stored in the manifests |
 | No free prompt slot | Omit a conflicting `--prompt-index`; automatic allocation uses the first unused slot |
 | Poor new-language output after a short run | A custom vocabulary resets the RNNT decoder/joint; add more clean transcribed speech and validate on held-out data |
+| Long stream loses speech in the middle | Re-prepare with the default long-form augmentation and retrain from the pretrained base checkpoint. Check that both manifests report long-form samples at training startup. |
 | Bench scripts: `conversion script not found` | Set `CONVERT_SCRIPT` envvar to point to your CrispASR conversion script |
 
 ## Reference
