@@ -68,7 +68,7 @@ The exact tokenizer directory and prompt index are also recorded in every new
 Lightning checkpoint, so checkpoint export and testing no longer have to guess
 which same-sized tokenizer belongs to a checkpoint.
 
-For the included Hugging Face Uyghur dataset, prepare and train with:
+For the two Hugging Face Uyghur datasets, prepare and train with:
 
 ```bash
 python prepare_hf_uyghur_fast.py --format flac
@@ -79,17 +79,10 @@ python asr_finetune_with_speechhints.py \
   --run-name uyghur-v2
 ```
 
-The preparation script uses the dataset's `sentence` column and `ug-CN`
-language prompt and exports the original dataset clips without concatenation.
-
-To combine `piyazon/cv-corpus-ug-24-latn` and `piyazon/thuyg20-datasets`, use:
-
-```bash
-python "prepare_hf_uyghur_fast copy.py" --format flac
-```
-
-This script uses the Arabic-script `sentence` column from both repositories and
-sets the language to `ug-CN`. It merges their training splits into
+The preparation script combines `piyazon/cv-corpus-ug-24-latn` and
+`piyazon/thuyg20-datasets`. It uses the Arabic-script `sentence` column from both
+repositories, sets the language to `ug-CN`, and exports the original clips
+without concatenation. It merges their training splits into
 `custom_asr_data/train_manifest.json` and their held-out splits into
 `custom_asr_data/test_manifest.json`, preferring `validation` over `test` when
 both exist. If a source has neither, it creates a seeded 98/2 row split for that

@@ -1,6 +1,5 @@
 """Check dataset merging and Arabic transcript selection without downloads."""
 
-import importlib.util
 import json
 from pathlib import Path
 import tempfile
@@ -9,10 +8,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "prepare_hf_uyghur_fast copy.py"
-spec = importlib.util.spec_from_file_location("prepare_combined_uyghur", SCRIPT)
-prepare = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(prepare)
+import prepare_hf_uyghur_fast as prepare
+
+SCRIPT = Path(prepare.__file__)
 
 
 class FakeSplit:
