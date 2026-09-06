@@ -188,7 +188,7 @@ steps), the effective peak learning rate is approximately `3.1e-4`.
 | `--train-workers` | 16 | Training data-loader processes; adjust for host CPU/RAM |
 | `--validation-workers` | 8 | Validation data-loader processes |
 | `--validation-batch-size` | 16 | Validation clips per batch |
-| `--fused-batch-size` | 4 | Clips per internal RNNT joint/loss batch |
+| `--fused-batch-size` | 8 | Clips per internal RNNT joint/loss batch |
 | `--log-every-n-steps` | 100 | Training metric logging interval in optimizer steps |
 | `--run-name` | none | Optional checkpoint subdirectory to keep retrains separate |
 | `--language` | `en-US` for new manifests | Locale used in manifests and prompt conditioning, e.g. `ug-CN` |
@@ -249,7 +249,7 @@ for all original languages.
 | Gradient clipping | 5.0 |
 | Max clip duration | 40s |
 | Batch duration | 720s (starting profile for RTX PRO 6000 96 GB) |
-| RNNT internal batch | 4 clips, with fused joint/loss/WER enabled |
+| RNNT internal batch | 8 clips, with fused joint/loss/WER enabled |
 | Data loading | 16 training workers, 8 validation workers, pinned host memory |
 | Validation | Batch size 16; WER decoding only (RNNT validation loss disabled) |
 | Training logging | Every 100 optimizer steps |
@@ -265,7 +265,7 @@ combined Uyghur dataset with clips up to about 65 seconds, start a new run with:
 ```bash
 python asr_finetune_with_speechhints.py --train-only \
   --language ug-CN --tokenizer-mode custom --max-duration 70 \
-  --batch-duration 720 --fused-batch-size 4 \
+  --batch-duration 720 --fused-batch-size 8 \
   --train-workers 16 --validation-workers 8 --validation-batch-size 16 \
   --log-every-n-steps 100 --run-name uyghur-96gb
 ```
@@ -273,19 +273,25 @@ python asr_finetune_with_speechhints.py --train-only \
 The duration budget controls the encoder batch. The internal RNNT batch controls
 how many clips the joint/loss processes together; it can constrain throughput
 even when the encoder batch is large. The script applies the internal size to
-both the live module and its saved config. See [NeMo's batch splitting
+both the live module and its saved config. Increasing only this internal size
+does not change the audio batch or the number of optimizer updates per epoch.
+See [NeMo's batch splitting
 documentation](https://docs.nvidia.com/nemo/speech/nightly/asr/configs.html#effect-of-fused-batch-step).
 
 Measure peak memory and audio processed per second across short and long clips.
-If there is ample headroom, try `--fused-batch-size 8` first, or increase the
-duration budget from 720 to 960 in a separate trial. Increasing workers helps
+Compare the internal batch of 8 against 4 before increasing it further. If 8
+improves throughput and peak memory leaves ample headroom on long clips, try
+`--fused-batch-size 16`, or increase the duration budget from 720 to 960 in a
+separate trial. Higher VRAM occupancy alone does not establish a speedup, and
+doubling the internal size does not necessarily double total VRAM usage.
+Increasing workers helps
 only when data loading is the bottleneck and host CPU/RAM are available. For an
-out-of-memory error during the joint/loss, lower the internal batch to 2 or 1;
+out-of-memory error during the joint/loss, lower the internal batch to 4, 2 or 1;
 for encoder memory pressure, lower the duration budget to 480 or 240. If validation
 runs out of memory, lower `--validation-batch-size` to 8 or 4. Keep the 70-second
 clip limit if those long recordings should remain in the dataset.
 
-Larger training batches also change the number of optimizer updates per epoch
+Increasing the audio batch duration changes the number of optimizer updates per epoch
 and the amount of audio seen during the step-based Noam warmup. Compare validation
 WER when changing batch sizes; higher GPU utilization alone does not establish
 better training quality. BF16 precision, learning-rate settings, model dimensions
@@ -463,7 +469,7 @@ finetune-kit/
 
 | Problem | Fix |
 |---------|-----|
-| `CUDA out of memory` | Lower `--batch-duration` from 720 to 480 or 240, and/or `--fused-batch-size` from 4 to 2 or 1; for validation, lower `--validation-batch-size` from 16 to 8 or 4 |
+| `CUDA out of memory` | Lower `--batch-duration` from 720 to 480 or 240, and/or `--fused-batch-size` from 8 to 4, 2 or 1; for validation, lower `--validation-batch-size` from 16 to 8 or 4 |
 | Numba CUDA compile error during RNNT loss | Reinstall the compatible CUDA target and NumPy constraint: `pip install --upgrade --force-reinstall "numpy>=1.26,<2.5" "numba-cuda[cu12]"` |
 | `Pretrained model not found` | Run the download command in [Quick Start](#quick-start) step 2 |
 | `No transcript.csv in pX, skipping` | Each speaker dir needs a `transcript.csv` (pipe-delimited, no header) |
