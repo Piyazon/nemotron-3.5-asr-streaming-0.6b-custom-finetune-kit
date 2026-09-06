@@ -82,6 +82,26 @@ python asr_finetune_with_speechhints.py \
 The preparation script uses the dataset's `sentence` column and `ug-CN`
 language prompt and exports the original dataset clips without concatenation.
 
+To combine `piyazon/cv-corpus-ug-24-latn` and `piyazon/thuyg20-datasets`, use:
+
+```bash
+python "prepare_hf_uyghur_fast copy.py" --format flac
+```
+
+This script uses the Arabic-script `sentence` column from both repositories and
+sets the language to `ug-CN`. It merges their training splits into
+`custom_asr_data/train_manifest.json` and their held-out splits into
+`custom_asr_data/test_manifest.json`, preferring `validation` over `test` when
+both exist. If a source has neither, it creates a seeded 98/2 row split for that
+source. The resulting manifests replace previous preparation results after both
+sources have exported successfully. Audio is stored separately by repository,
+dataset fingerprint and split, preventing row-index collisions and stale reuse.
+
+The default maximum duration is 40 seconds. To include longer recordings, pass
+the same `--max-duration` value to preparation and training, for example `70`.
+The export log reports skipped clips and their reasons. Loading the repositories
+uses your existing Hugging Face login or `HF_TOKEN` when access is required.
+
 ---
 
 ## Data Preparation
@@ -166,6 +186,8 @@ steps), the effective peak learning rate is approximately `3.1e-4`.
 |------|---------|-------------|
 | `--epochs` | 20 | Maximum training epochs (for full training) |
 | `--lr` | 0.1 | Noam learning-rate scale factor (not raw AdamW LR) |
+| `--encoder-lr-scale` | 1.0 | Encoder learning rate relative to the decoder/joint rate; use 0.1 to experiment with slower acoustic updates |
+| `--seed` | 42 | Seed for model initialization and data loading; GPU kernels can still be nondeterministic |
 | `--warmup-steps` | 100 | Noam linear warmup steps |
 | `--noam-d-model` | 1024 | Model dimension used by Noam scaling |
 | `--max-duration` | 40 | Maximum train/validation clip duration in seconds |
@@ -250,11 +272,89 @@ for this recipe.
 | `nemotron-asr-finetuned.nemo` | Final epoch (regardless of WER) |
 
 TensorBoard logs → `checkpoints/tb_logs/`.
+The training run also saves `training_config.yaml`, including the seed and
+encoder learning-rate multiplier. Its startup log reports median and 95th
+percentile training clip durations so you can compare training coverage with
+recordings that fail in deployment.
 
 ### Step 4 — Evaluation
-Loads the latest checkpoint, transcribes every test sample with the manifest's
-language prompt, and computes corpus **WER** (Word Error Rate) using NeMo's
-built-in metric. It prints sample transcriptions for inspection.
+Loads the **best validation-WER export** from the selected run and transcribes
+every evaluation sample with the manifest's language prompt. A full pipeline run
+evaluates the exact best export it just trained. Use `--run-name` to select a
+specific run, or `--checkpoint` to evaluate a particular `.nemo` archive. Without
+either, evaluation selects best1 from the most recently exported run.
+
+Evaluation computes corpus **WER**, **CER**, word substitutions, deletions and
+insertions using JiWER. It writes `summary.json` and `transcriptions.jsonl` under
+`<checkpoint-directory>/evaluation/<model-name>/<manifest-name>/`, or under
+`--report-dir`. Repeating evaluation at the same location replaces those reports.
+Each recording includes its reference, hypothesis, duration, deletion rate and
+deleted text spans. The summary also groups results into under 10s, 10–20s,
+20–40s and 40s or longer. Rates are computed from total edit counts, rather than
+averaging recording-level rates.
+
+Scoring normalizes Unicode to NFC and collapses whitespace. It retains case
+and punctuation, and CER includes spaces. Deleted spans are text alignments;
+they do not identify audio timestamps or prove that the model emitted blanks.
+
+```bash
+python asr_finetune_with_speechhints.py --evaluate --language ug-CN --run-name uyghur-v2
+
+# Compare a particular model on accurately transcribed problem recordings.
+python asr_finetune_with_speechhints.py --evaluate \
+  --checkpoint /path/to/model.nemo \
+  --eval-manifest /path/to/problem_recordings.jsonl \
+  --report-dir /path/to/evaluation-report
+```
+
+`test_checkpoint.py` and `export_checkpoint_to_nemo.py` also default to the best
+validation-WER `.ckpt`, recovered from Lightning's saved callback metadata.
+Use `--run-name uyghur-v2` to restrict selection to one run, `--selection latest`
+to test the newest retained weights, or `--checkpoint /path/to/model.ckpt` to
+choose explicitly. A missing best checkpoint or missing selection metadata
+requires an explicit selection; it does not silently fall back to another model.
+
+### Investigating skipped speech
+
+First evaluate the existing best model and inspect recordings with high deletion
+rates. Compare the same audio in NeMo and in the deployed runtime, with the same
+checkpoint and `ug-CN` prompt. For a missing passage, also try a separate crop
+that includes some surrounding speech.
+
+For the next controlled training experiment, a smaller encoder learning rate
+lets the randomly initialized decoder/joint learn faster relative to the
+pretrained acoustic encoder:
+
+```bash
+python asr_finetune_with_speechhints.py --train-only \
+  --language ug-CN --tokenizer-mode custom \
+  --encoder-lr-scale 0.1 --seed 42 --run-name uyghur-slower-encoder
+```
+
+Compare this with `--encoder-lr-scale 1.0` using the same data, seed and epoch
+budget in a separate run. The existing default remains 1.0. With the default
+Noam settings, scale 0.1 gives an encoder peak LR of approximately `3.1e-5` and
+a decoder/joint peak LR of `3.1e-4`. Both groups use the existing Noam schedule;
+the encoder continues training throughout. This is an experiment, not a
+confirmed remedy for omissions.
+
+Before extending training, listen to samples while reading the exact manifest
+transcripts. Check that all spoken phrases are transcribed and that augmentations
+preserve the audio/text pairing. Keep all variants of a source recording in the
+same split; the preparation script's random row split does not ensure this.
+Use validation speech representative of deployment speakers, noise and duration,
+and keep a separate final test set: this kit currently uses `test_manifest.json`
+for checkpoint selection, so that manifest serves as validation data. Review both
+WER and deletion rate; reducing deletions while greatly increasing insertions is
+not an improvement.
+
+Regression checks for selection, scoring and optimizer grouping can run without
+NeMo or a GPU:
+
+```bash
+python -m pip install 'jiwer>=3.1,<5'
+python -m unittest discover -s tests -v
+```
 
 ---
 

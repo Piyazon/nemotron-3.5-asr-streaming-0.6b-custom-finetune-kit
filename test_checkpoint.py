@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transcribe test_files/ audio with the newest retained checkpoint.
+"""Transcribe test_files/ audio with the best validation-WER checkpoint.
 
 This reconstructs the custom tokenizer and language prompt before loading the
 Lightning checkpoint.  Loading the checkpoint directly into the untouched base
@@ -22,6 +22,8 @@ import json
 import re
 import sys
 from pathlib import Path
+
+from checkpoint_selection import latest_checkpoint, run_directory, select_checkpoint
 
 
 # =============================================================================
@@ -111,28 +113,8 @@ def find_audio_files(audio: str | None) -> list[Path]:
 
 
 def find_latest_checkpoint() -> Path:
-    """Return the newest stable, epoch-named checkpoint.
-
-    The epoch checkpoint is preferred over ``last.ckpt`` because ``last.ckpt``
-    may be replaced while a concurrent training process finishes an epoch.
-    """
-    epoch_checkpoints = list(
-        CHECKPOINT_DIR.rglob("nemotron-asr-finetuned-epoch=*.ckpt")
-    )
-
-    if epoch_checkpoints:
-        def checkpoint_order(path: Path) -> tuple[int, int]:
-            match = re.search(r"epoch=(\d+)", path.name)
-            epoch = int(match.group(1)) if match else -1
-            return path.stat().st_mtime_ns, epoch
-
-        return max(epoch_checkpoints, key=checkpoint_order)
-
-    last_checkpoints = list(CHECKPOINT_DIR.rglob("last.ckpt"))
-    if last_checkpoints:
-        return max(last_checkpoints, key=lambda path: path.stat().st_mtime_ns)
-
-    raise FileNotFoundError(f"No .ckpt files found in: {CHECKPOINT_DIR}")
+    """Compatibility helper for callers explicitly requesting the latest weights."""
+    return latest_checkpoint(CHECKPOINT_DIR)
 
 
 def find_latest_tokenizer(language: str) -> Path:
@@ -257,7 +239,7 @@ def configure_language_prompt(model, language: str, requested_index: int | None)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Transcribe test_files/ audio with the latest custom-language checkpoint."
+        description="Transcribe test_files/ audio with the best custom-language checkpoint."
     )
     parser.add_argument(
         "audio",
@@ -271,8 +253,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         default=CHECKPOINT,
-        help="Specific .ckpt file; default: newest retained epoch checkpoint",
+        help="Specific .ckpt file; overrides automatic selection",
     )
+    parser.add_argument("--run-name", help="Select checkpoints within this training run")
+    parser.add_argument("--selection", choices=("best", "latest"), default="best",
+                        help="Automatic checkpoint selection (default: best validation WER)")
     parser.add_argument(
         "--tokenizer-dir",
         default=TOKENIZER_DIR,
@@ -298,13 +283,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    args = parse_args()
     if sys.platform == "darwin":
         raise SystemExit(
             "This inference script is disabled on macOS. Run it on the Linux "
             "server with the NeMo/CUDA environment."
         )
-
-    args = parse_args()
 
     # Heavy ML/audio imports deliberately occur after the macOS guard.
     import librosa
@@ -313,7 +297,9 @@ def main() -> None:
 
     audio_paths = find_audio_files(args.audio)
     checkpoint_path = (
-        resolve_path(args.checkpoint) if args.checkpoint else find_latest_checkpoint()
+        resolve_path(args.checkpoint) if args.checkpoint else select_checkpoint(
+            run_directory(CHECKPOINT_DIR, args.run_name), args.selection
+        )
     )
 
     for label, path in (

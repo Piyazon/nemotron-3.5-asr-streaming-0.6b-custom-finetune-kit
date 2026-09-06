@@ -33,6 +33,7 @@ huggingface-hub
 # --- Audio / Data helpers ---
 librosa
 soundfile
+jiwer>=3.1,<5
 
 # --- Utilities ---
 Cython

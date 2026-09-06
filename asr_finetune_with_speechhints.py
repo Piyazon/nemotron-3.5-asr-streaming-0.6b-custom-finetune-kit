@@ -35,12 +35,17 @@ import argparse
 import glob
 import hashlib
 import json
+import math
 import os
 import random
 import re
+import statistics
 import subprocess
 import sys
 import unicodedata
+from pathlib import Path
+
+from checkpoint_selection import best_nemo_checkpoint, run_directory
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -168,7 +173,7 @@ def read_manifest_entries(manifest_path: str) -> list[dict]:
                     f"Manifest entry must be a JSON object in {manifest_path} "
                     f"at line {line_num}"
                 )
-            if not str(entry.get("text", "")).strip():
+            if not isinstance(entry.get("text"), str) or not entry["text"].strip():
                 raise ValueError(
                     f"Missing transcript text in {manifest_path} at line {line_num}"
                 )
@@ -239,9 +244,9 @@ def manifest_duration_summary(manifest_path: str) -> dict[str, float | int]:
             raise ValueError(
                 f"Invalid duration in {manifest_path} at entry {line_num}"
             ) from exc
-        if duration <= 0:
+        if not math.isfinite(duration) or duration <= 0:
             raise ValueError(
-                f"Duration must be positive in {manifest_path} at entry {line_num}"
+                f"Duration must be finite and positive in {manifest_path} at entry {line_num}"
             )
         durations.append(duration)
 
@@ -249,7 +254,28 @@ def manifest_duration_summary(manifest_path: str) -> dict[str, float | int]:
         "samples": len(durations),
         "hours": sum(durations) / 3600.0,
         "maximum": max(durations),
+        "median": statistics.median(durations),
+        "p95": sorted(durations)[math.ceil(len(durations) * 0.95) - 1],
     }
+
+
+def optimizer_parameter_groups(model, lr: float, encoder_lr_scale: float) -> list[dict]:
+    """Retain Noam scaling while optionally updating the encoder more slowly."""
+    if not math.isfinite(encoder_lr_scale) or not 0 < encoder_lr_scale <= 1:
+        raise ValueError("--encoder-lr-scale must be greater than 0 and at most 1")
+    encoder_ids = {id(parameter) for parameter in model.encoder.parameters()}
+    encoder, other = [], []
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            (encoder if id(parameter) in encoder_ids else other).append(parameter)
+    return [
+        {"params": parameters, "lr": group_lr, "name": name}
+        for name, parameters, group_lr in (
+            ("encoder", encoder, lr * encoder_lr_scale),
+            ("decoder_joint_prompt", other, lr),
+        )
+        if parameters
+    ]
 
 
 def build_custom_tokenizer(
@@ -530,7 +556,9 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
                  run_name: str | None = None,
                  train_workers: int = DEFAULT_TRAIN_WORKERS,
                  validation_workers: int = DEFAULT_VALIDATION_WORKERS,
-                 validation_batch_size: int = DEFAULT_VALIDATION_BATCH_SIZE):
+                 validation_batch_size: int = DEFAULT_VALIDATION_BATCH_SIZE,
+                 encoder_lr_scale: float = 1.0,
+                 seed: int = RANDOM_SEED):
     """Fine-tune the pretrained model using NeMo's Python API directly.
 
     Loads EncDecRNNTBPEModelWithPrompt from the .nemo file, updates data
@@ -544,8 +572,12 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         raise ValueError(
             "tokenizer_mode must be one of: 'auto', 'base', or 'custom'"
         )
-    if lr <= 0:
+    if not math.isfinite(lr) or lr <= 0:
         raise ValueError("--lr must be positive")
+    if not math.isfinite(encoder_lr_scale) or not 0 < encoder_lr_scale <= 1:
+        raise ValueError("--encoder-lr-scale must be greater than 0 and at most 1")
+    if not 0 <= seed < 2**32:
+        raise ValueError("--seed must be in [0, 2**32)")
     if max_duration <= 0 or batch_duration <= 0:
         raise ValueError("--max-duration and --batch-duration must be positive")
     if warmup_steps <= 0:
@@ -558,7 +590,7 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         raise ValueError("--validation-batch-size must be positive")
     if run_name is not None:
         run_name = run_name.strip()
-        if not run_name or not re.fullmatch(r"[A-Za-z0-9_.-]+", run_name):
+        if not run_name or not re.fullmatch(r"[A-Za-z0-9_.-]+", run_name) or run_name in {".", ".."}:
             raise ValueError(
                 "--run-name may contain only letters, digits, dot, underscore, and dash"
             )
@@ -574,6 +606,7 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     log(
         "Training manifest: "
         f"{train_summary['samples']:,} samples, {train_summary['hours']:.2f} h, "
+        f"median={train_summary['median']:.2f}s, p95={train_summary['p95']:.2f}s, "
         f"max={train_summary['maximum']:.2f}s"
     )
     log(
@@ -612,9 +645,11 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     # ------------------------------------------------------------------
     from nemo.collections.asr.models import EncDecRNNTBPEModelWithPrompt
     from omegaconf import OmegaConf, open_dict
-    from lightning.pytorch import Trainer
+    from lightning.pytorch import Trainer, seed_everything
     from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
     from lightning.pytorch.loggers import TensorBoardLogger
+
+    seed_everything(seed, workers=True)
 
     # ------------------------------------------------------------------
     # Load pretrained model
@@ -740,6 +775,8 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     model.cfg.train_ds.manifest_filepath = train_manifest
     model.cfg.train_ds.is_tarred = False
     model.cfg.train_ds.shuffle = True
+    model.cfg.train_ds.seed = seed
+    model.cfg.train_ds.shard_seed = seed
     model.cfg.train_ds.num_workers = train_workers
     model.cfg.train_ds.pin_memory = True
     model.cfg.train_ds.max_duration = max_duration
@@ -755,6 +792,8 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     OmegaConf.set_struct(model.cfg.validation_ds, False)
     model.cfg.validation_ds.manifest_filepath = test_manifest
     model.cfg.validation_ds.is_tarred = False
+    model.cfg.validation_ds.seed = seed
+    model.cfg.validation_ds.shard_seed = seed
     model.cfg.validation_ds.num_workers = validation_workers
     model.cfg.validation_ds.pin_memory = True
     # Validation avoids gradient storage, so a larger batch remains practical.
@@ -790,6 +829,8 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
                 "validation_workers": validation_workers,
                 "validation_batch_size": validation_batch_size,
                 "run_name": run_name,
+                "encoder_lr_scale": encoder_lr_scale,
+                "seed": seed,
             }
         )
 
@@ -808,6 +849,8 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     model.cfg.optim.sched.d_model = noam_d_model
     OmegaConf.set_struct(model.cfg.optim.sched, True)
     OmegaConf.set_struct(model.cfg.optim, True)
+
+    OmegaConf.save(model.cfg, os.path.join(checkpoint_dir, "training_config.yaml"), resolve=True)
 
     # ------------------------------------------------------------------
     # Set up data loaders on the model
@@ -847,7 +890,7 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         optim_cfg = self.cfg.optim
         betas = tuple(optim_cfg.get("betas", (0.9, 0.98)))
         optimizer = _torch.optim.AdamW(
-            self.parameters(),
+            optimizer_parameter_groups(self, float(optim_cfg.lr), encoder_lr_scale),
             lr=float(optim_cfg.lr),
             betas=betas,
             weight_decay=float(optim_cfg.weight_decay),
@@ -865,6 +908,7 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
             f"warmup={warmup_steps}, d_model={noam_d_model}, "
             f"effective peak LR~{peak_lr:.3g}, wd={optim_cfg.weight_decay}"
         )
+        log(f"Encoder peak LR~{peak_lr * encoder_lr_scale:.3g} (scale={encoder_lr_scale:g})")
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -926,6 +970,7 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     # ------------------------------------------------------------------
     # ModelCheckpoint.best_k_models is a dict {ckpt_path: monitor_score}
     best_k = checkpoint_cb.best_k_models     # type: dict[str, float]
+    best_nemo_path = None
 
     if best_k:
         import torch as _torch
@@ -958,6 +1003,8 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
             model.load_state_dict(sd)
 
             model.save_to(nemo_path)
+            if rank == 1:
+                best_nemo_path = nemo_path
             log(f"    -> Saved: {nemo_path}")
 
         # Restore the final-epoch weights back into `model`
@@ -973,40 +1020,34 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     log(f"\nTraining complete!")
     log(f"Final model saved to: {final_nemo}")
     log(f"Best checkpoints in:  {checkpoint_dir}")
+    return best_nemo_path
 
 
 # ---------------------------------------------------------------------------
 # Step 4  -  Evaluate (CER / WER) using NeMo Python API
 # ---------------------------------------------------------------------------
-def find_nemo_checkpoint() -> str | None:
-    """Search common output locations for the latest .nemo file."""
-    search_bases = [CHECKPOINT_DIR, os.path.join(DATA_DIR, "checkpoints")]
-
-    for base in search_bases:
-        matches = glob.glob(os.path.join(base, "**", "*.nemo"), recursive=True)
-        # Exclude the pretrained model
-        matches = [m for m in matches if "pretrained_model" not in m]
-        if matches:
-            return max(matches, key=os.path.getmtime)  # latest
-    return None
+def find_nemo_checkpoint(run_name: str | None = None) -> str:
+    """Select best1 from the requested run, or the most recently exported run."""
+    return str(best_nemo_checkpoint(run_directory(Path(CHECKPOINT_DIR), run_name)))
 
 
-def run_evaluation(test_manifest: str, language: str | None = None):
-    """Run prompt-conditioned inference on the test manifest and compute WER."""
+def run_evaluation(test_manifest: str, language: str | None = None,
+                   checkpoint: str | None = None, run_name: str | None = None,
+                   report_dir: str | None = None):
+    """Evaluate a selected model and persist per-recording deletion diagnostics."""
     import warnings
     warnings.filterwarnings("ignore")
 
     from nemo.collections.asr.models import EncDecRNNTBPEModelWithPrompt
     from lightning.pytorch import Trainer
-    from nemo.collections.asr.metrics.wer import word_error_rate
+    from asr_evaluation import score_transcription, summarize_scores
 
     language = resolve_manifest_language(test_manifest, language)
+    manifest_duration_summary(test_manifest)
 
-    nemo_file = find_nemo_checkpoint()
-    if not nemo_file:
-        print(f"\n[ERROR] No .nemo checkpoint found.")
-        print(f"Searched under: {CHECKPOINT_DIR} and {DATA_DIR}/checkpoints/")
-        sys.exit(1)
+    nemo_file = str(Path(checkpoint).expanduser().resolve()) if checkpoint else find_nemo_checkpoint(run_name)
+    if not Path(nemo_file).is_file() or Path(nemo_file).suffix != ".nemo":
+        raise ValueError(f"Evaluation requires an existing .nemo archive: {nemo_file}")
 
     log(f"Evaluating checkpoint: {nemo_file}")
 
@@ -1030,13 +1071,15 @@ def run_evaluation(test_manifest: str, language: str | None = None):
     entries = read_manifest_entries(test_manifest)
 
     log(f"Transcribing {len(entries)} samples ...")
-    hyps = []
-    refs = []
+    records = []
+    report_path = Path(report_dir).expanduser() if report_dir else (
+        Path(nemo_file).parent / "evaluation" / Path(nemo_file).stem / Path(test_manifest).stem
+    )
+    report_path.mkdir(parents=True, exist_ok=True)
 
     for i, entry in enumerate(entries):
         audio_path = entry["audio_filepath"]
         ref_text = entry["text"]
-        refs.append(ref_text)
 
         result = model.transcribe(
             audio=[audio_path],
@@ -1050,26 +1093,48 @@ def run_evaluation(test_manifest: str, language: str | None = None):
             if isinstance(hypothesis, str)
             else str(getattr(hypothesis, "text", hypothesis))
         ).strip()
-        hyps.append(hyp_text)
+        records.append({
+            "audio_filepath": audio_path,
+            "duration": float(entry["duration"]),
+            "reference": ref_text,
+            "hypothesis": hyp_text,
+            **score_transcription(ref_text, hyp_text),
+        })
 
         if (i + 1) % 5 == 0 or i == len(entries) - 1:
             log(f"  Transcribed {i+1}/{len(entries)}")
 
-    # NeMo's string helper computes corpus-level WER.  Keep case because the
-    # checkpoint is trained for native punctuation and capitalization.
-    wer = word_error_rate(hypotheses=hyps, references=refs)
+    summary = {
+        "checkpoint": nemo_file,
+        "manifest": str(Path(test_manifest).resolve()),
+        "language": language,
+        "normalization": "NFC and whitespace only; case and punctuation retained; CER includes spaces",
+        **summarize_scores(records),
+    }
+    with open(report_path / "transcriptions.jsonl", "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with open(report_path / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2, allow_nan=False)
+        f.write("\n")
     log(f"\n{'=' * 50}")
     log(f"Evaluation Results")
     log(f"{'=' * 50}")
-    log(f"Samples : {len(refs)}")
-    log(f"WER     : {wer:.2%}")
+    log(f"Samples : {len(records)}")
+    log(f"WER     : {summary['wer']:.2%}")
+    log(f"CER     : {summary['cer']:.2%}")
+    log(f"Deleted words: {summary['deletions']} ({summary['deletion_rate']:.2%} of reference words)")
+    log(f"Reports : {report_path.resolve()}")
 
     # Show a few examples
-    log(f"\n--- Sample transcriptions ---")
-    for i in range(min(5, len(refs))):
-        log(f"  Ref : {refs[i]}")
-        log(f"  Hyp : {hyps[i]}")
+    log("\n--- Recordings with the highest deletion rates ---")
+    for record in sorted(records, key=lambda r: r["deletion_rate"], reverse=True)[:5]:
+        log(f"  File: {record['audio_filepath']} ({record['duration']:.1f}s)")
+        log(f"  Ref : {record['reference']}")
+        log(f"  Hyp : {record['hypothesis']}")
+        log(f"  Deleted spans: {record['deleted_spans']}")
         log()
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -1132,6 +1197,9 @@ def main():
                         help="Only run fine-tuning (step 3)")
     parser.add_argument("--evaluate", action="store_true",
                         help="Only evaluate trained model (step 4)")
+    parser.add_argument("--checkpoint", help="Specific .nemo archive for --evaluate")
+    parser.add_argument("--eval-manifest", help="Reference manifest for --evaluate; defaults to test_manifest.json")
+    parser.add_argument("--report-dir", help="Directory for evaluation JSON/JSONL reports")
     parser.add_argument("--apply-speechhints", action="store_true",
                         help="Post-process manifests with speech-hint grammars")
     parser.add_argument(
@@ -1172,6 +1240,10 @@ def main():
     )
     parser.add_argument("--epochs", type=int, default=20,
                         help="Max training epochs (default: 20)")
+    parser.add_argument("--seed", type=int, default=RANDOM_SEED,
+                        help=f"Training random seed (default: {RANDOM_SEED})")
+    parser.add_argument("--encoder-lr-scale", type=float, default=1.0,
+                        help="Encoder LR relative to decoder/joint LR, in (0, 1]; default: 1")
     parser.add_argument("--lr", type=float, default=0.1,
                         help=(
                             "Noam learning-rate scale factor, not the raw AdamW LR "
@@ -1244,6 +1316,9 @@ def main():
     )
     args = parser.parse_args()
 
+    if (args.checkpoint or args.eval_manifest) and not args.evaluate:
+        parser.error("--checkpoint and --eval-manifest are only used with --evaluate")
+
     if sys.platform == "darwin":
         parser.error(
             "This pipeline is intentionally disabled on macOS. Run it on a "
@@ -1271,7 +1346,7 @@ def main():
         )
 
         log("\n>>> Step 3: Fine-tuning model ...")
-        run_training(
+        trained_checkpoint = run_training(
             train_manifest,
             test_manifest,
             epochs=args.epochs,
@@ -1288,10 +1363,15 @@ def main():
             train_workers=args.train_workers,
             validation_workers=args.validation_workers,
             validation_batch_size=args.validation_batch_size,
+            encoder_lr_scale=args.encoder_lr_scale,
+            seed=args.seed,
         )
 
         log("\n>>> Step 4: Evaluating model ...")
-        run_evaluation(test_manifest, language=manifest_language)
+        if trained_checkpoint is None:
+            raise RuntimeError("Training did not produce a best-WER checkpoint to evaluate")
+        run_evaluation(test_manifest, language=manifest_language,
+                       checkpoint=trained_checkpoint, report_dir=args.report_dir)
 
         log("\n" + "=" * 70)
         log("Pipeline complete!")
@@ -1335,15 +1415,19 @@ def main():
             train_workers=args.train_workers,
             validation_workers=args.validation_workers,
             validation_batch_size=args.validation_batch_size,
+            encoder_lr_scale=args.encoder_lr_scale,
+            seed=args.seed,
         )
         return
 
     if args.evaluate:
-        test_manifest = os.path.join(CUSTOM_DATA_DIR, "test_manifest.json")
+        test_manifest = args.eval_manifest or os.path.join(CUSTOM_DATA_DIR, "test_manifest.json")
         if not os.path.exists(test_manifest):
             print("[ERROR] test_manifest.json not found. Run training first.")
             sys.exit(1)
-        run_evaluation(test_manifest, language=args.language)
+        run_evaluation(test_manifest, language=args.language,
+                       checkpoint=args.checkpoint, run_name=args.run_name,
+                       report_dir=args.report_dir)
         return
 
 

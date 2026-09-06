@@ -18,12 +18,12 @@ from test_checkpoint import (
     LANGUAGE,
     PROMPT_INDEX,
     configure_language_prompt,
-    find_latest_checkpoint,
     find_latest_tokenizer,
     prompt_index_from_checkpoint,
     resolve_path,
     tokenizer_dir_from_checkpoint,
 )
+from checkpoint_selection import run_directory, select_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,8 +32,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--checkpoint",
-        help="Specific .ckpt; default: newest retained epoch checkpoint",
+        help="Specific .ckpt; overrides automatic selection",
     )
+    parser.add_argument("--run-name", help="Select checkpoints within this training run")
+    parser.add_argument("--selection", choices=("best", "latest"), default="best",
+                        help="Automatic checkpoint selection (default: best validation WER)")
     parser.add_argument(
         "--output",
         help="Output .nemo path; default: checkpoint directory with epoch in its name",
@@ -79,6 +82,7 @@ def default_output_path(
 
 
 def main() -> None:
+    args = parse_args()
     if sys.platform == "darwin":
         raise SystemExit(
             "Checkpoint export requires the Linux NeMo training environment. "
@@ -89,9 +93,10 @@ def main() -> None:
     import torch
     from nemo.collections.asr.models import EncDecRNNTBPEModelWithPrompt
 
-    args = parse_args()
     checkpoint_path = (
-        resolve_path(args.checkpoint) if args.checkpoint else find_latest_checkpoint()
+        resolve_path(args.checkpoint) if args.checkpoint else select_checkpoint(
+            run_directory(CHECKPOINT_DIR, args.run_name), args.selection
+        )
     )
 
     for label, path in (
