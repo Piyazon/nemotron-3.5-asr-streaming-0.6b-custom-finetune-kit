@@ -35,6 +35,9 @@ librosa
 soundfile
 jiwer>=3.1,<5
 
+# --- Experiment tracking (enabled in training with --wandb) ---
+wandb>=0.19,<1
+
 # --- Utilities ---
 Cython
 matplotlib

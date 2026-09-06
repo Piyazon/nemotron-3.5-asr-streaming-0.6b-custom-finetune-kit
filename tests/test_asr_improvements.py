@@ -202,7 +202,8 @@ class EvaluationIntegrationTests(unittest.TestCase):
 
     def test_full_pipeline_evaluates_the_best_export_it_just_trained(self):
         with patch("sys.argv", ["train", "--language", "ug-CN", "--encoder-lr-scale", "0.1",
-                                "--fused-batch-size", "8", "--log-every-n-steps", "200"]), \
+                                "--fused-batch-size", "8", "--log-every-n-steps", "200",
+                                "--wandb", "--wandb-project", "uyghur", "--wandb-entity", "asr-team"]), \
                 patch("sys.platform", "linux"), \
                 patch("asr_finetune_with_speechhints.log"), \
                 patch("asr_finetune_with_speechhints.convert_audio"), \
@@ -213,13 +214,18 @@ class EvaluationIntegrationTests(unittest.TestCase):
         self.assertEqual(training.call_args.kwargs["encoder_lr_scale"], 0.1)
         self.assertEqual(training.call_args.kwargs["fused_batch_size"], 8)
         self.assertEqual(training.call_args.kwargs["log_every_n_steps"], 200)
+        self.assertTrue(training.call_args.kwargs["wandb_enabled"])
+        self.assertEqual(training.call_args.kwargs["wandb_project"], "uyghur")
+        self.assertEqual(training.call_args.kwargs["wandb_entity"], "asr-team")
+        self.assertFalse(training.call_args.kwargs["wandb_offline"])
         evaluation.assert_called_once_with(
             "valid.json", language="ug-CN", checkpoint="this-run-best.nemo", report_dir=None,
         )
 
     def test_train_only_forwards_explicit_throughput_settings(self):
         with patch("sys.argv", ["train", "--train-only", "--batch-duration", "960",
-                                "--fused-batch-size", "8", "--log-every-n-steps", "200"]), \
+                                "--fused-batch-size", "8", "--log-every-n-steps", "200",
+                                "--wandb", "--wandb-project", "uyghur", "--wandb-offline"]), \
                 patch("sys.platform", "linux"), \
                 patch("asr_finetune_with_speechhints.os.path.exists", return_value=True), \
                 patch("asr_finetune_with_speechhints.resolve_manifest_language", return_value="ug-CN"), \
@@ -228,6 +234,9 @@ class EvaluationIntegrationTests(unittest.TestCase):
         self.assertEqual(training.call_args.kwargs["batch_duration"], 960)
         self.assertEqual(training.call_args.kwargs["fused_batch_size"], 8)
         self.assertEqual(training.call_args.kwargs["log_every_n_steps"], 200)
+        self.assertTrue(training.call_args.kwargs["wandb_enabled"])
+        self.assertEqual(training.call_args.kwargs["wandb_project"], "uyghur")
+        self.assertTrue(training.call_args.kwargs["wandb_offline"])
 
 
 if __name__ == "__main__":

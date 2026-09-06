@@ -191,6 +191,10 @@ steps), the effective peak learning rate is approximately `3.1e-4`.
 | `--fused-batch-size` | 8 | Clips per internal RNNT joint/loss batch |
 | `--log-every-n-steps` | 100 | Training metric logging interval in optimizer steps |
 | `--run-name` | none | Optional checkpoint subdirectory to keep retrains separate |
+| `--wandb` | off | Log metrics to Weights & Biases alongside TensorBoard |
+| `--wandb-project` | `nemotron-asr-finetune` | W&B project; requires `--wandb` |
+| `--wandb-entity` | account default | W&B team or username; requires `--wandb` |
+| `--wandb-offline` | off | Save W&B data locally for later synchronization; requires `--wandb` |
 | `--language` | `en-US` for new manifests | Locale used in manifests and prompt conditioning, e.g. `ug-CN` |
 | `--tokenizer-mode` | `auto` | Choose `auto`, `base`, or `custom` |
 | `--tokenizer-vocab-size` | 2048 | Requested generated BPE size (minimum 512) |
@@ -312,6 +316,54 @@ the pretrained model; rerunning it does not resume the currently running job.
 | `nemotron-asr-finetuned.nemo` | Final epoch (regardless of WER) |
 
 TensorBoard logs → `checkpoints/tb_logs/`.
+
+**Weights & Biases (optional)**
+
+Install the tracking dependency on your training server and authenticate once:
+
+```bash
+python -m pip install 'wandb>=0.19,<1'
+wandb login
+```
+
+Add `--wandb --wandb-project nemotron-uyghur` to your existing Python training
+command. For example, using the starting 96 GB profile:
+
+```bash
+python asr_finetune_with_speechhints.py --train-only \
+  --language ug-CN --tokenizer-mode custom --epochs 20 --max-duration 70 \
+  --batch-duration 720 --fused-batch-size 8 \
+  --train-workers 16 --validation-workers 8 --validation-batch-size 16 \
+  --log-every-n-steps 100 --run-name uyghur-wandb \
+  --wandb --wandb-project nemotron-uyghur
+```
+
+Use `--wandb-entity your-team` to select a team. The W&B run display name comes
+from `--run-name`; each launch normally creates a new W&B run. This does not add
+training checkpoint resume support or attach to an already-running process.
+
+The integration uses Lightning's [WandbLogger](https://docs.wandb.ai/models/integrations/lightning)
+to record NeMo's training loss and batch WER, learning rates, epoch/global step,
+and the aggregate `val_wer` after every full validation pass. Training metrics
+follow `--log-every-n-steps`; validation WER is logged every epoch. WER is a
+fraction (`0.25` means 25%), and the run summary tracks its minimum. Validation
+loss remains disabled. Configuration includes the tokenizer/prompt settings,
+Noam schedule, batch settings, and manifest statistics.
+
+TensorBoard remains enabled. Checkpoints are saved locally (`log_model=False`),
+and gradient watching and reference/prediction console capture are disabled to
+keep tracking overhead small. W&B writes its local files under
+`checkpoints/wandb_logs/wandb/` and prints the dashboard URL for an online run.
+The W&B run is closed and flushed when training finishes or raises an exception.
+
+For a server without W&B access, add `--wandb-offline` along with `--wandb`.
+Offline tracking needs no login. Later, authenticate with `wandb login` and sync
+the specific offline run directory:
+
+```bash
+wandb sync /path/to/offline-run-directory
+```
+
 The training run also saves `training_config.yaml`, including the seed and
 encoder learning-rate multiplier. Its startup log reports median and 95th
 percentile training clip durations so you can compare training coverage with

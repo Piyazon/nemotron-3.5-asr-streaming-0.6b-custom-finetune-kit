@@ -32,6 +32,7 @@ pip install "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main"
 """
 
 import argparse
+from contextlib import contextmanager
 import glob
 import hashlib
 import json
@@ -75,6 +76,7 @@ DEFAULT_VALIDATION_WORKERS = 8
 DEFAULT_VALIDATION_BATCH_SIZE = 16
 DEFAULT_FUSED_BATCH_SIZE = 8
 DEFAULT_LOG_EVERY_N_STEPS = 100
+DEFAULT_WANDB_PROJECT = "nemotron-asr-finetune"
 DEFAULT_WARMUP_STEPS = 100
 DEFAULT_NOAM_D_MODEL = 1024
 
@@ -567,6 +569,62 @@ def build_manifests(
 # ---------------------------------------------------------------------------
 # Step 3  -  Fine-tune with NeMo Python API (no cloned repo needed)
 # ---------------------------------------------------------------------------
+@contextmanager
+def training_loggers(*, run_name: str | None = None,
+                     wandb_enabled: bool = False,
+                     wandb_project: str | None = None,
+                     wandb_entity: str | None = None,
+                     wandb_offline: bool = False,
+                     hyperparameters: dict | None = None):
+    """Keep TensorBoard and optionally track this fit in a separate W&B run."""
+    from lightning.pytorch.loggers import TensorBoardLogger
+
+    loggers = [TensorBoardLogger(
+        save_dir=os.path.join(DATA_DIR, "checkpoints", "tb_logs"),
+        name="nemotron-asr-finetune",
+    )]
+    wandb_run = None
+    completed = False
+    try:
+        if wandb_enabled:
+            try:
+                import wandb
+                from lightning.pytorch.loggers import WandbLogger
+            except ImportError as exc:
+                raise RuntimeError(
+                    "W&B logging requires wandb. Install it with: "
+                    "python -m pip install 'wandb>=0.19,<1'"
+                ) from exc
+
+            save_dir = os.path.join(DATA_DIR, "checkpoints", "wandb_logs")
+            os.makedirs(save_dir, exist_ok=True)
+            wandb_logger = WandbLogger(
+                project=wandb_project or DEFAULT_WANDB_PROJECT,
+                entity=wandb_entity,
+                name=run_name,
+                save_dir=save_dir,
+                offline=wandb_offline,
+                log_model=False,
+                # Reference/prediction console output can be large. Track
+                # scalars and config without copying that output to W&B.
+                settings=wandb.Settings(console="off"),
+            )
+            wandb_run = wandb_logger.experiment
+            wandb_logger.log_hyperparams(hyperparameters or {})
+            wandb_run.define_metric("val_wer", summary="min")
+            loggers.append(wandb_logger)
+            log(f"W&B logging enabled; local files: {save_dir}")
+            if wandb_run.url:
+                log(f"W&B dashboard: {wandb_run.url}")
+        yield loggers
+        completed = True
+    finally:
+        if wandb_run is not None:
+            # WandbLogger.finalize() handles artifacts but does not close the
+            # run. Flush metrics even if training raises an exception.
+            wandb_run.finish(exit_code=0 if completed else 1)
+
+
 def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
                  lr: float = 0.1, language: str = DEFAULT_LANGUAGE,
                  tokenizer_mode: str = "auto",
@@ -583,7 +641,11 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
                  encoder_lr_scale: float = 1.0,
                  seed: int = RANDOM_SEED,
                  fused_batch_size: int = DEFAULT_FUSED_BATCH_SIZE,
-                 log_every_n_steps: int = DEFAULT_LOG_EVERY_N_STEPS):
+                 log_every_n_steps: int = DEFAULT_LOG_EVERY_N_STEPS,
+                 wandb_enabled: bool = False,
+                 wandb_project: str | None = None,
+                 wandb_entity: str | None = None,
+                 wandb_offline: bool = False):
     """Fine-tune the pretrained model using NeMo's Python API directly.
 
     Loads EncDecRNNTBPEModelWithPrompt from the .nemo file, updates data
@@ -617,6 +679,11 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         raise ValueError("--fused-batch-size must be positive")
     if log_every_n_steps <= 0:
         raise ValueError("--log-every-n-steps must be positive")
+    if not wandb_enabled and (wandb_project is not None or wandb_entity is not None or wandb_offline):
+        raise ValueError("W&B options require --wandb")
+    for flag, value in (("--wandb-project", wandb_project), ("--wandb-entity", wandb_entity)):
+        if value is not None and not value.strip():
+            raise ValueError(f"{flag} cannot be empty")
     if run_name is not None:
         run_name = run_name.strip()
         if not run_name or not re.fullmatch(r"[A-Za-z0-9_.-]+", run_name) or run_name in {".", ".."}:
@@ -677,7 +744,6 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     from omegaconf import OmegaConf, open_dict
     from lightning.pytorch import Trainer, seed_everything
     from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
-    from lightning.pytorch.loggers import TensorBoardLogger
 
     seed_everything(seed, workers=True)
 
@@ -864,6 +930,10 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
                 "validation_batch_size": validation_batch_size,
                 "fused_batch_size": fused_batch_size,
                 "log_every_n_steps": log_every_n_steps,
+                "wandb_enabled": wandb_enabled,
+                "wandb_project": (wandb_project or DEFAULT_WANDB_PROJECT) if wandb_enabled else None,
+                "wandb_entity": wandb_entity,
+                "wandb_offline": wandb_offline,
                 "run_name": run_name,
                 "encoder_lr_scale": encoder_lr_scale,
                 "seed": seed,
@@ -974,33 +1044,44 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
-    tb_logger = TensorBoardLogger(
-        save_dir=os.path.join(DATA_DIR, "checkpoints", "tb_logs"),
-        name="nemotron-asr-finetune",
-    )
-
     # ------------------------------------------------------------------
     # PyTorch Lightning Trainer
     # ------------------------------------------------------------------
-    trainer = Trainer(
-        devices=1,
-        max_epochs=epochs,
-        precision="bf16-mixed",
-        callbacks=[checkpoint_cb, lr_monitor],
-        logger=tb_logger,
-        accumulate_grad_batches=1,
-        gradient_clip_val=5.0,
-        log_every_n_steps=log_every_n_steps,
-        val_check_interval=1.0,  # validate once per epoch
-        enable_progress_bar=True,
-        benchmark=True,
-    )
+    with training_loggers(
+        run_name=run_name,
+        wandb_enabled=wandb_enabled,
+        wandb_project=wandb_project,
+        wandb_entity=wandb_entity,
+        wandb_offline=wandb_offline,
+        hyperparameters={
+            "training": {
+                **OmegaConf.to_container(model.cfg.custom_finetune, resolve=True),
+                "epochs": epochs,
+                "noam_lr_scale": lr,
+                "warmup_steps": warmup_steps,
+                "noam_d_model": noam_d_model,
+                "precision": "bf16-mixed",
+                "train_manifest_summary": train_summary,
+                "validation_manifest_summary": validation_summary,
+            },
+        },
+    ) as loggers:
+        trainer = Trainer(
+            devices=1,
+            max_epochs=epochs,
+            precision="bf16-mixed",
+            callbacks=[checkpoint_cb, lr_monitor],
+            logger=loggers,
+            accumulate_grad_batches=1,
+            gradient_clip_val=5.0,
+            log_every_n_steps=log_every_n_steps,
+            val_check_interval=1.0,  # validate once per epoch
+            enable_progress_bar=True,
+            benchmark=True,
+        )
 
-    # ------------------------------------------------------------------
-    # Train!
-    # ------------------------------------------------------------------
-    log(f"\nStarting fine-tuning ({epochs} epochs, Noam scale={lr}) ...\n")
-    trainer.fit(model, train_dataloaders=train_dl, val_dataloaders=val_dl)
+        log(f"\nStarting fine-tuning ({epochs} epochs, Noam scale={lr}) ...\n")
+        trainer.fit(model, train_dataloaders=train_dl, val_dataloaders=val_dl)
     # ------------------------------------------------------------------
     # Convert top-3 best checkpoints (lowest WER) to .nemo
     # ------------------------------------------------------------------
@@ -1365,10 +1446,22 @@ def main():
             "example uyghur-v2; prevents mixing a retrain with old files"
         ),
     )
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable Weights & Biases logging alongside TensorBoard")
+    parser.add_argument("--wandb-project", default=None,
+                        help=f"W&B project (default with --wandb: {DEFAULT_WANDB_PROJECT})")
+    parser.add_argument("--wandb-entity", default=None,
+                        help="W&B team or username (default: your W&B account settings)")
+    parser.add_argument("--wandb-offline", action="store_true",
+                        help="With --wandb, save locally for later wandb sync; no login needed")
     args = parser.parse_args()
 
     if (args.checkpoint or args.eval_manifest) and not args.evaluate:
         parser.error("--checkpoint and --eval-manifest are only used with --evaluate")
+    if not args.wandb and (args.wandb_project is not None or args.wandb_entity is not None or args.wandb_offline):
+        parser.error("--wandb-project, --wandb-entity, and --wandb-offline require --wandb")
+    if args.wandb and any([args.convert_only, args.manifest_only, args.evaluate, args.apply_speechhints]):
+        parser.error("--wandb is supported with --train-only or the full training pipeline")
 
     if sys.platform == "darwin":
         parser.error(
@@ -1418,6 +1511,10 @@ def main():
             seed=args.seed,
             fused_batch_size=args.fused_batch_size,
             log_every_n_steps=args.log_every_n_steps,
+            wandb_enabled=args.wandb,
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity,
+            wandb_offline=args.wandb_offline,
         )
 
         log("\n>>> Step 4: Evaluating model ...")
@@ -1472,6 +1569,10 @@ def main():
             seed=args.seed,
             fused_batch_size=args.fused_batch_size,
             log_every_n_steps=args.log_every_n_steps,
+            wandb_enabled=args.wandb,
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity,
+            wandb_offline=args.wandb_offline,
         )
         return
 
