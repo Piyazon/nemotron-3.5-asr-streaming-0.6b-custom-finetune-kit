@@ -67,10 +67,14 @@ TOKENIZER_ROOT_DIR = os.path.join(CUSTOM_DATA_DIR, "tokenizers")
 DEFAULT_LANGUAGE = "en-US"
 DEFAULT_TOKENIZER_VOCAB_SIZE = 2048
 DEFAULT_MAX_DURATION = 40.0
-DEFAULT_BATCH_DURATION = 240.0
-DEFAULT_TRAIN_WORKERS = 8
+# Starting throughput profile for one RTX PRO 6000 Blackwell 96 GB.
+# Actual memory requirements depend on audio and transcript lengths.
+DEFAULT_BATCH_DURATION = 720.0
+DEFAULT_TRAIN_WORKERS = 16
 DEFAULT_VALIDATION_WORKERS = 8
-DEFAULT_VALIDATION_BATCH_SIZE = 4
+DEFAULT_VALIDATION_BATCH_SIZE = 16
+DEFAULT_FUSED_BATCH_SIZE = 4
+DEFAULT_LOG_EVERY_N_STEPS = 100
 DEFAULT_WARMUP_STEPS = 100
 DEFAULT_NOAM_D_MODEL = 1024
 
@@ -276,6 +280,25 @@ def optimizer_parameter_groups(model, lr: float, encoder_lr_scale: float) -> lis
         )
         if parameters
     ]
+
+
+def configure_rnnt_training(model, fused_batch_size: int) -> None:
+    """Update live RNNT batching and persist matching settings for export."""
+    from omegaconf import open_dict
+
+    if fused_batch_size <= 0:
+        raise ValueError("--fused-batch-size must be positive")
+    previous_size = model.joint.fused_batch_size
+    model.joint.set_fused_batch_size(fused_batch_size)
+    model.joint.set_fuse_loss_wer(True, loss=model.loss, metric=model.wer)
+    # NeMo copies this config flag into an instance attribute at construction.
+    # Updating cfg alone does not disable loss computation during validation.
+    model.compute_eval_loss = False
+    with open_dict(model.cfg):
+        model.cfg.joint.fuse_loss_wer = True
+        model.cfg.joint.fused_batch_size = fused_batch_size
+        model.cfg.compute_eval_loss = False
+    log(f"RNNT internal batch size: {previous_size} -> {fused_batch_size}")
 
 
 def build_custom_tokenizer(
@@ -558,7 +581,9 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
                  validation_workers: int = DEFAULT_VALIDATION_WORKERS,
                  validation_batch_size: int = DEFAULT_VALIDATION_BATCH_SIZE,
                  encoder_lr_scale: float = 1.0,
-                 seed: int = RANDOM_SEED):
+                 seed: int = RANDOM_SEED,
+                 fused_batch_size: int = DEFAULT_FUSED_BATCH_SIZE,
+                 log_every_n_steps: int = DEFAULT_LOG_EVERY_N_STEPS):
     """Fine-tune the pretrained model using NeMo's Python API directly.
 
     Loads EncDecRNNTBPEModelWithPrompt from the .nemo file, updates data
@@ -578,8 +603,8 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         raise ValueError("--encoder-lr-scale must be greater than 0 and at most 1")
     if not 0 <= seed < 2**32:
         raise ValueError("--seed must be in [0, 2**32)")
-    if max_duration <= 0 or batch_duration <= 0:
-        raise ValueError("--max-duration and --batch-duration must be positive")
+    if not all(math.isfinite(value) and value > 0 for value in (max_duration, batch_duration)):
+        raise ValueError("--max-duration and --batch-duration must be finite and positive")
     if warmup_steps <= 0:
         raise ValueError("--warmup-steps must be positive for the Noam scheduler")
     if noam_d_model <= 0:
@@ -588,6 +613,10 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         raise ValueError("Data-loader worker counts cannot be negative")
     if validation_batch_size <= 0:
         raise ValueError("--validation-batch-size must be positive")
+    if fused_batch_size <= 0:
+        raise ValueError("--fused-batch-size must be positive")
+    if log_every_n_steps <= 0:
+        raise ValueError("--log-every-n-steps must be positive")
     if run_name is not None:
         run_name = run_name.strip()
         if not run_name or not re.fullmatch(r"[A-Za-z0-9_.-]+", run_name) or run_name in {".", ".."}:
@@ -615,10 +644,11 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         f"max={validation_summary['maximum']:.2f}s"
     )
     log(
-        "RTX 5090 data profile: "
+        "Training data profile (defaults target RTX PRO 6000 96 GB): "
         f"batch_duration={batch_duration:g}s, train_workers={train_workers}, "
         f"validation_batch_size={validation_batch_size}, "
-        f"validation_workers={validation_workers}, pinned_memory=True"
+        f"validation_workers={validation_workers}, pinned_memory=True, "
+        f"fused_batch_size={fused_batch_size}, log_every_n_steps={log_every_n_steps}"
     )
     if train_summary["maximum"] > max_duration:
         warn(
@@ -780,6 +810,8 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     model.cfg.train_ds.num_workers = train_workers
     model.cfg.train_ds.pin_memory = True
     model.cfg.train_ds.max_duration = max_duration
+    # A retained fixed batch_size would cap the duration-based batch budget.
+    model.cfg.train_ds.batch_size = None
     model.cfg.train_ds.batch_duration = batch_duration
     model.cfg.train_ds.initialize_prompt_feature = True
     model.cfg.train_ds.prompt_dictionary = OmegaConf.create(prompt_dictionary)
@@ -798,6 +830,7 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     model.cfg.validation_ds.pin_memory = True
     # Validation avoids gradient storage, so a larger batch remains practical.
     model.cfg.validation_ds.batch_size = validation_batch_size
+    model.cfg.validation_ds.batch_duration = None
     model.cfg.validation_ds.max_duration = max_duration
     model.cfg.validation_ds.initialize_prompt_feature = True
     model.cfg.validation_ds.prompt_dictionary = OmegaConf.create(prompt_dictionary)
@@ -807,13 +840,14 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     model.cfg.validation_ds.default_lang = language
     OmegaConf.set_struct(model.cfg.validation_ds, True)
 
+    # Configure the live joint after change_vocabulary() has rebuilt it.
+    # This bounds the large RNNT joint tensor independently of encoder batches.
+    configure_rnnt_training(model, fused_batch_size)
+
     # ------------------------------------------------------------------
     # Record enough provenance to reconstruct custom-vocabulary checkpoints
     # without guessing which generated tokenizer was used.
     with open_dict(model.cfg):
-        # Checkpoint selection monitors val_wer, so skip the memory-intensive
-        # RNNT validation loss for the larger validation batch.
-        model.cfg.compute_eval_loss = False
         model.cfg.custom_finetune = OmegaConf.create(
             {
                 "language": language,
@@ -828,6 +862,8 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
                 "train_workers": train_workers,
                 "validation_workers": validation_workers,
                 "validation_batch_size": validation_batch_size,
+                "fused_batch_size": fused_batch_size,
+                "log_every_n_steps": log_every_n_steps,
                 "run_name": run_name,
                 "encoder_lr_scale": encoder_lr_scale,
                 "seed": seed,
@@ -879,7 +915,7 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     import torch as _torch
     from nemo.core.optim.lr_scheduler import NoamAnnealing
 
-    # RTX 5090/Blackwell benefits from Tensor Core paths for any float32
+    # Blackwell benefits from Tensor Core paths for any float32
     # operations that remain around the BF16 mixed-precision training graph.
     _torch.set_float32_matmul_precision("high")
     if _torch.cuda.is_available():
@@ -954,7 +990,7 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         logger=tb_logger,
         accumulate_grad_batches=1,
         gradient_clip_val=5.0,
-        log_every_n_steps=10,
+        log_every_n_steps=log_every_n_steps,
         val_check_interval=1.0,  # validate once per epoch
         enable_progress_bar=True,
         benchmark=True,
@@ -1285,7 +1321,7 @@ def main():
         default=DEFAULT_TRAIN_WORKERS,
         help=(
             "Training data-loader processes "
-            f"(default: {DEFAULT_TRAIN_WORKERS} for a 32 GB RTX 5090 host)"
+            f"(default: {DEFAULT_TRAIN_WORKERS}; adjust to available host CPU/RAM)"
         ),
     )
     parser.add_argument(
@@ -1305,6 +1341,21 @@ def main():
             "Validation clips per batch "
             f"(default: {DEFAULT_VALIDATION_BATCH_SIZE})"
         ),
+    )
+    parser.add_argument(
+        "--fused-batch-size",
+        type=int,
+        default=DEFAULT_FUSED_BATCH_SIZE,
+        help=(
+            "Clips per internal RNNT joint/loss batch; increasing trades GPU memory "
+            f"for potential throughput (default: {DEFAULT_FUSED_BATCH_SIZE})"
+        ),
+    )
+    parser.add_argument(
+        "--log-every-n-steps",
+        type=int,
+        default=DEFAULT_LOG_EVERY_N_STEPS,
+        help=f"Training metric logging interval in optimizer steps (default: {DEFAULT_LOG_EVERY_N_STEPS})",
     )
     parser.add_argument(
         "--run-name",
@@ -1365,6 +1416,8 @@ def main():
             validation_batch_size=args.validation_batch_size,
             encoder_lr_scale=args.encoder_lr_scale,
             seed=args.seed,
+            fused_batch_size=args.fused_batch_size,
+            log_every_n_steps=args.log_every_n_steps,
         )
 
         log("\n>>> Step 4: Evaluating model ...")
@@ -1417,6 +1470,8 @@ def main():
             validation_batch_size=args.validation_batch_size,
             encoder_lr_scale=args.encoder_lr_scale,
             seed=args.seed,
+            fused_batch_size=args.fused_batch_size,
+            log_every_n_steps=args.log_every_n_steps,
         )
         return
 

@@ -1,6 +1,7 @@
 """Regression checks runnable without NeMo, CUDA, or model downloads."""
 
 import json
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import tempfile
@@ -10,8 +11,8 @@ from types import SimpleNamespace
 
 from asr_evaluation import aggregate_scores, score_transcription, summarize_scores
 from asr_finetune_with_speechhints import (
-    main, manifest_duration_summary, optimizer_parameter_groups, read_manifest_entries,
-    run_evaluation,
+    configure_rnnt_training, main, manifest_duration_summary,
+    optimizer_parameter_groups, read_manifest_entries, run_evaluation, run_training,
 )
 from checkpoint_selection import (
     best_checkpoint_from_state, best_nemo_checkpoint, latest_checkpoint, run_directory,
@@ -112,6 +113,31 @@ class CheckpointSelectionTests(unittest.TestCase):
 
 
 class TrainingSetupTests(unittest.TestCase):
+    def test_runtime_validation_loss_is_disabled_alongside_saved_config(self):
+        model = SimpleNamespace(
+            cfg=SimpleNamespace(joint=SimpleNamespace(), compute_eval_loss=True),
+            compute_eval_loss=True, loss=object(), wer=object(),
+            joint=Mock(fused_batch_size=1),
+        )
+        with patch.dict("sys.modules", {"omegaconf": SimpleNamespace(open_dict=lambda cfg: nullcontext())}), \
+                patch("asr_finetune_with_speechhints.log"):
+            configure_rnnt_training(model, 4)
+        self.assertFalse(model.compute_eval_loss)
+        self.assertFalse(model.cfg.compute_eval_loss)
+        self.assertTrue(model.cfg.joint.fuse_loss_wer)
+        self.assertEqual(model.cfg.joint.fused_batch_size, 4)
+        model.joint.set_fused_batch_size.assert_called_once_with(4)
+        model.joint.set_fuse_loss_wer.assert_called_once_with(True, loss=model.loss, metric=model.wer)
+
+    def test_invalid_throughput_controls_fail_before_loading_model(self):
+        for kwargs, flag in (
+            ({"fused_batch_size": 0}, "--fused-batch-size"),
+            ({"log_every_n_steps": 0}, "--log-every-n-steps"),
+            ({"batch_duration": float("nan")}, "--batch-duration"),
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, flag):
+                run_training("unused-train.json", "unused-test.json", **kwargs)
+
     def test_encoder_lr_reduction_does_not_affect_joint_or_prompt(self):
         encoder, decoder, prompt = [SimpleNamespace(requires_grad=True) for _ in range(3)]
         frozen = SimpleNamespace(requires_grad=False)
@@ -175,7 +201,8 @@ class EvaluationIntegrationTests(unittest.TestCase):
             self.assertEqual(model.transcribe.call_args.kwargs["target_lang"], "ug-CN")
 
     def test_full_pipeline_evaluates_the_best_export_it_just_trained(self):
-        with patch("sys.argv", ["train", "--language", "ug-CN", "--encoder-lr-scale", "0.1"]), \
+        with patch("sys.argv", ["train", "--language", "ug-CN", "--encoder-lr-scale", "0.1",
+                                "--fused-batch-size", "8", "--log-every-n-steps", "200"]), \
                 patch("sys.platform", "linux"), \
                 patch("asr_finetune_with_speechhints.log"), \
                 patch("asr_finetune_with_speechhints.convert_audio"), \
@@ -184,9 +211,23 @@ class EvaluationIntegrationTests(unittest.TestCase):
                 patch("asr_finetune_with_speechhints.run_evaluation") as evaluation:
             main()
         self.assertEqual(training.call_args.kwargs["encoder_lr_scale"], 0.1)
+        self.assertEqual(training.call_args.kwargs["fused_batch_size"], 8)
+        self.assertEqual(training.call_args.kwargs["log_every_n_steps"], 200)
         evaluation.assert_called_once_with(
             "valid.json", language="ug-CN", checkpoint="this-run-best.nemo", report_dir=None,
         )
+
+    def test_train_only_forwards_explicit_throughput_settings(self):
+        with patch("sys.argv", ["train", "--train-only", "--batch-duration", "960",
+                                "--fused-batch-size", "8", "--log-every-n-steps", "200"]), \
+                patch("sys.platform", "linux"), \
+                patch("asr_finetune_with_speechhints.os.path.exists", return_value=True), \
+                patch("asr_finetune_with_speechhints.resolve_manifest_language", return_value="ug-CN"), \
+                patch("asr_finetune_with_speechhints.run_training") as training:
+            main()
+        self.assertEqual(training.call_args.kwargs["batch_duration"], 960)
+        self.assertEqual(training.call_args.kwargs["fused_batch_size"], 8)
+        self.assertEqual(training.call_args.kwargs["log_every_n_steps"], 200)
 
 
 if __name__ == "__main__":
