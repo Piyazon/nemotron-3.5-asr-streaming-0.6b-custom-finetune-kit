@@ -422,12 +422,20 @@ bash train.sh
 
 It uses the existing `custom_asr_data/train_manifest.json` and
 `custom_asr_data/test_manifest.json`, a custom 2,048-token vocabulary, 50 epochs,
-Noam scale 0.1 with 100 warmup steps, encoder LR scale 0.3, a 1,920-second audio
-batch, RNNT internal batch 64, and run name `uyghur-arabic-v2-enc03`. The peak
-decoder/joint LR is `3.125e-4`; the encoder peak is `9.375e-5`. The encoder rate
-is an experiment, not a guaranteed WER improvement. To repeat with a separate
-run name, use `bash train.sh --run-name another-name`. A fresh run refuses to
-reuse a directory containing model checkpoints.
+Noam scale 0.1 with 100 warmup steps, encoder LR scale 1.0, a 1,920-second audio
+batch, RNNT internal batch 64, and run name `uyghur-arabic-v2-enc10`. Both
+encoder and decoder/joint have a peak LR of `3.125e-4`. This restores the
+previous encoder rate while retaining the loss/config fixes. To repeat with
+a separate run name, use `bash train.sh --run-name another-name`. A fresh run
+refuses to reuse a directory containing model checkpoints.
+
+The earlier `uyghur-arabic-v2-enc03` experiment used encoder scale 0.3 and
+showed higher training and validation WER at comparable steps through roughly
+28k updates. The new recipe tests scale 1.0 with the other revised settings
+held constant. The earlier comparison also changed the live loss settings, so
+it does not isolate encoder rate as the sole cause. Compare validation curves
+at matched steps before committing to the full epoch budget. Editing this
+recipe affects future launches; an active training process keeps its settings.
 
 Vocabulary replacement can reset NeMo's live RNNT loss to defaults. The script
 now restores the configured backend, FastEmit/clamp options, reduction, and fused
@@ -446,7 +454,7 @@ directory. The epoch limit is the **total target**, not additional epochs:
 
 ```bash
 python asr_finetune_with_speechhints.py --train-only --language ug-CN \
-  --resume-from checkpoints/FastConformer-Transducer-BPE-Prompt-Streaming/test/uyghur-arabic-v2-enc03/last.ckpt \
+  --resume-from checkpoints/FastConformer-Transducer-BPE-Prompt-Streaming/test/uyghur-arabic-v2-enc10/last.ckpt \
   --epochs 60 --train-workers 32 --validation-workers 16 \
   --validation-batch-size 16 --fused-batch-size 64 \
   --wandb --wandb-project nemotron-uyghur
@@ -467,7 +475,7 @@ its weights with an explicitly chosen peak LR, for example:
 ```bash
 python asr_finetune_with_speechhints.py --train-only --language ug-CN \
   --init-from-nemo /path/to/best-model.nemo \
-  --peak-lr 2e-5 --encoder-lr-scale 0.3 --warmup-steps 100 \
+  --peak-lr 2e-5 --encoder-lr-scale 1.0 --warmup-steps 100 \
   --epochs 10 --max-duration 70 --batch-duration 1920 --fused-batch-size 64 \
   --train-workers 32 --validation-workers 16 --validation-batch-size 16 \
   --run-name uyghur-arabic-refine --wandb --wandb-project nemotron-uyghur
@@ -484,10 +492,10 @@ The learning rate above is a trial setting; select it using held-out validation.
 default. Compare the same checkpoint and recording with explicit beam search:
 
 ```bash
-python test_checkpoint.py sample2.mp3 --run-name uyghur-arabic-v2-enc03
-python test_checkpoint.py sample2.mp3 --run-name uyghur-arabic-v2-enc03 \
+python test_checkpoint.py sample2.mp3 --run-name uyghur-arabic-v2-enc10
+python test_checkpoint.py sample2.mp3 --run-name uyghur-arabic-v2-enc10 \
   --decoding-strategy beam --beam-size 4
-python test_checkpoint.py sample2.mp3 --run-name uyghur-arabic-v2-enc03 \
+python test_checkpoint.py sample2.mp3 --run-name uyghur-arabic-v2-enc10 \
   --decoding-strategy beam --beam-size 8
 ```
 
@@ -502,12 +510,11 @@ rates. Compare the same audio in NeMo and in the deployed runtime, with the same
 checkpoint and `ug-CN` prompt. For a missing passage, also try a separate crop
 that includes some surrounding speech.
 
-The fresh recipe uses `--encoder-lr-scale 0.3` so the newly initialized
-decoder/joint learns faster relative to the pretrained acoustic encoder.
-Both groups use the same Noam schedule, and the encoder keeps training.
-For an encoder-rate comparison, use `bash train.sh --encoder-lr-scale 1.0
---run-name uyghur-arabic-v2-enc10` with the same data, seed and epoch budget.
-The underlying Python CLI default remains 1.0.
+The fresh recipe and Python CLI both use `--encoder-lr-scale 1.0`.
+Both parameter groups follow the same Noam schedule. Keep the same manifests,
+tokenizer, seed, batch settings and validation decoding when comparing encoder
+rates. For a new stage with different optimization settings, use
+`--init-from-nemo`; `--resume-from` deliberately restores the original rates.
 
 Before extending training, listen to samples while reading the exact manifest
 transcripts. Check that all spoken phrases are transcribed and that augmentations
