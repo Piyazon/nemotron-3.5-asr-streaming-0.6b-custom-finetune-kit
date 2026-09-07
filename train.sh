@@ -13,13 +13,13 @@ python asr_finetune_with_speechhints.py \
   --lr 0.1 \
   --warmup-steps 100 \
   --seed 42 \
-  --epochs 50 \
+  --epochs 100 \
   --max-duration 70 \
   --batch-duration 1920 \
   --fused-batch-size 64 \
   --train-workers 32 \
-  --validation-workers 16 \
-  --validation-batch-size 16 \
+  --validation-workers 32 \
+  --validation-batch-size 32 \
   --log-every-n-steps 100 \
   --run-name uyghur-arabic-v2-enc10 \
   --wandb --wandb-project nemotron-uyghur \
