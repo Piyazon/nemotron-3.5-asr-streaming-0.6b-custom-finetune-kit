@@ -47,6 +47,13 @@ import unicodedata
 from pathlib import Path
 
 from checkpoint_selection import best_nemo_checkpoint, run_directory
+from tokenizer_diagnostics import diagnose_tokenizer
+from training_loss import restore_configured_rnnt_loss
+from training_state import (
+    construct_resume_model, file_sha256, noam_scale_for_peak,
+    prepare_resume_config, resume_settings, validate_resume_manifests,
+    persist_tokenizer, validate_optimizer_group_names,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -271,11 +278,15 @@ def optimizer_parameter_groups(model, lr: float, encoder_lr_scale: float) -> lis
         raise ValueError("--encoder-lr-scale must be greater than 0 and at most 1")
     encoder_ids = {id(parameter) for parameter in model.encoder.parameters()}
     encoder, other = [], []
-    for parameter in model.parameters():
+    # Vocabulary replacement changes nn.Module registration order. Adam state
+    # restoration is positional, so use stable names across reconstruction.
+    for name, parameter in sorted(model.named_parameters()):
         if parameter.requires_grad:
-            (encoder if id(parameter) in encoder_ids else other).append(parameter)
+            (encoder if id(parameter) in encoder_ids else other).append((name, parameter))
     return [
-        {"params": parameters, "lr": group_lr, "name": name}
+        {"params": [parameter for _, parameter in parameters],
+         "param_names": [parameter_name for parameter_name, _ in parameters],
+         "lr": group_lr, "name": name}
         for name, parameters, group_lr in (
             ("encoder", encoder, lr * encoder_lr_scale),
             ("decoder_joint_prompt", other, lr),
@@ -645,7 +656,11 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
                  wandb_enabled: bool = False,
                  wandb_project: str | None = None,
                  wandb_entity: str | None = None,
-                 wandb_offline: bool = False):
+                 wandb_offline: bool = False,
+                 resume_from: str | None = None,
+                 init_from_nemo: str | None = None,
+                 tokenizer_dir: str | None = None,
+                 peak_lr: float | None = None):
     """Fine-tune the pretrained model using NeMo's Python API directly.
 
     Loads EncDecRNNTBPEModelWithPrompt from the .nemo file, updates data
@@ -655,6 +670,16 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     warnings.filterwarnings("ignore")
 
     language = language.strip()
+    if epochs <= 0:
+        raise ValueError("--epochs must be positive")
+    if resume_from and init_from_nemo:
+        raise ValueError("--resume-from and --init-from-nemo are mutually exclusive")
+    if tokenizer_dir and not resume_from:
+        raise ValueError("--tokenizer-dir is only for locating the original tokenizer with --resume-from")
+    if resume_from and peak_lr is not None:
+        raise ValueError("Resume restores the saved scheduler; use --init-from-nemo to change --peak-lr")
+    if init_from_nemo and peak_lr is None:
+        raise ValueError("--init-from-nemo requires an explicit --peak-lr for the new fine-tuning stage")
     if tokenizer_mode not in {"auto", "base", "custom"}:
         raise ValueError(
             "tokenizer_mode must be one of: 'auto', 'base', or 'custom'"
@@ -671,6 +696,8 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         raise ValueError("--warmup-steps must be positive for the Noam scheduler")
     if noam_d_model <= 0:
         raise ValueError("--noam-d-model must be positive")
+    if peak_lr is not None:
+        lr = noam_scale_for_peak(peak_lr, noam_d_model, warmup_steps)
     if train_workers < 0 or validation_workers < 0:
         raise ValueError("Data-loader worker counts cannot be negative")
     if validation_batch_size <= 0:
@@ -690,9 +717,39 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
             raise ValueError(
                 "--run-name may contain only letters, digits, dot, underscore, and dash"
             )
-    checkpoint_dir = (
-        os.path.join(CHECKPOINT_DIR, run_name) if run_name else CHECKPOINT_DIR
-    )
+    resume_cfg = None
+    resume_step = None
+    saved_optimizer_groups = None
+    if resume_from:
+        import torch
+        resume_from = str(Path(resume_from).expanduser().resolve())
+        if not Path(resume_from).is_file() or Path(resume_from).suffix != ".ckpt":
+            raise ValueError("--resume-from requires an existing Lightning .ckpt file")
+        saved = torch.load(resume_from, map_location="cpu", weights_only=False, mmap=True)
+        resume_cfg, tokenizer_dir = prepare_resume_config(saved, tokenizer_dir)
+        settings = resume_settings(resume_cfg, saved)
+        if settings["language"] != language:
+            raise ValueError("Resume language differs from the saved checkpoint language")
+        if epochs <= int(saved["epoch"]) + 1:
+            raise ValueError("--epochs is the total target epoch count; it must exceed the completed checkpoint epochs")
+        validate_resume_manifests(resume_cfg, train_manifest, test_manifest)
+        lr = settings["lr"]
+        encoder_lr_scale = settings["encoder_lr_scale"]
+        warmup_steps, noam_d_model = settings["warmup_steps"], settings["noam_d_model"]
+        max_duration, batch_duration, seed = settings["max_duration"], settings["batch_duration"], settings["seed"]
+        tokenizer_mode, tokenizer_vocab_size = settings["tokenizer_mode"], settings["tokenizer_vocab_size"]
+        resume_step = int(saved["global_step"])
+        saved_optimizer_groups = saved["optimizer_states"][0]["param_groups"]
+        run_name = run_name or resume_cfg.custom_finetune.get("run_name")
+        checkpoint_dir = str(Path(resume_from).parent)
+        del saved
+        log(f"Resuming step {resume_step} in {checkpoint_dir}; optimizer, schedule, tokenizer, batch duration, max duration and seed use saved settings")
+        if not resume_cfg.custom_finetune.get("configured_rnnt_loss_restored", False):
+            warn("This older checkpoint predates the loss fix. Its configured RNNT/FastEmit loss will now be used; the historical live loss may have differed.")
+    else:
+        checkpoint_dir = os.path.join(CHECKPOINT_DIR, run_name) if run_name else CHECKPOINT_DIR
+        if list(Path(checkpoint_dir).glob("*.ckpt")) or list(Path(checkpoint_dir).glob("*.nemo")):
+            raise ValueError("This run directory already contains checkpoints. Choose a new --run-name or use --resume-from")
     os.makedirs(checkpoint_dir, exist_ok=True)
     resolve_manifest_language(train_manifest, requested=language)
     resolve_manifest_language(test_manifest, requested=language)
@@ -727,7 +784,11 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
             f"Validation entries longer than --max-duration={max_duration:g}s "
             "will be filtered by the data loader."
         )
-    if not os.path.exists(PRETRAINED_MODEL):
+    if init_from_nemo:
+        init_from_nemo = str(Path(init_from_nemo).expanduser().resolve())
+        if not Path(init_from_nemo).is_file() or Path(init_from_nemo).suffix != ".nemo":
+            raise ValueError("--init-from-nemo requires an existing .nemo archive")
+    if not resume_from and not init_from_nemo and not os.path.exists(PRETRAINED_MODEL):
         print(f"\n[ERROR] Pretrained model not found: {PRETRAINED_MODEL}")
         print("Download with:")
         print(
@@ -750,13 +811,17 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     # ------------------------------------------------------------------
     # Load pretrained model
     # ------------------------------------------------------------------
-    model_size = os.path.getsize(PRETRAINED_MODEL) / 1024 ** 3
-    log(f"Loading pretrained model: {PRETRAINED_MODEL} ({model_size:.1f} GB)")
-
-    model = EncDecRNNTBPEModelWithPrompt.restore_from(
-        restore_path=PRETRAINED_MODEL,
-        map_location="cpu",
-    )
+    if resume_cfg is not None:
+        model = construct_resume_model(EncDecRNNTBPEModelWithPrompt, resume_cfg)
+        log("Constructed the saved architecture and original tokenizer; Lightning will restore all training state")
+    else:
+        model_path = init_from_nemo or PRETRAINED_MODEL
+        model_size = os.path.getsize(model_path) / 1024 ** 3
+        log(f"Loading model: {model_path} ({model_size:.1f} GB)")
+        model = EncDecRNNTBPEModelWithPrompt.restore_from(
+            restore_path=model_path,
+            map_location="cpu",
+        )
     log("Model loaded successfully.")
 
     # ------------------------------------------------------------------
@@ -783,9 +848,12 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         f"({unknown_rate:.2%})"
     )
 
-    use_custom_tokenizer = tokenizer_mode == "custom" or (
+    continuing = bool(resume_from or init_from_nemo)
+    if continuing and not prompt_was_known:
+        raise ValueError("Continuation requires the language prompt already present in the checkpoint")
+    use_custom_tokenizer = not continuing and (tokenizer_mode == "custom" or (
         tokenizer_mode == "auto" and (not prompt_was_known or unknown > 0)
-    )
+    ))
     if use_custom_tokenizer:
         reasons = []
         if not prompt_was_known:
@@ -804,17 +872,44 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
             new_tokenizer_dir=tokenizer_dir,
             new_tokenizer_type="bpe",
         )
+        restore_configured_rnnt_loss(model)
         log(
             "Installed generated tokenizer. NeMo reinitialized the RNNT "
             "decoder/joint for the new vocabulary; the acoustic encoder was retained."
         )
         active_tokenizer_dir = os.path.abspath(tokenizer_dir)
+    elif continuing:
+        active_tokenizer_dir = tokenizer_dir or model.cfg.get("custom_finetune", {}).get("tokenizer_dir")
+        tokenizer_mode = model.cfg.get("custom_finetune", {}).get("tokenizer_mode", "base")
+        tokenizer_vocab_size = int(model.tokenizer.vocab_size)
+        log("Preserving checkpoint tokenizer, decoder/joint weights and language prompt")
     else:
         log(
             "Keeping the pretrained tokenizer "
             f"(--tokenizer-mode={tokenizer_mode}, language already representable)."
         )
         active_tokenizer_dir = None
+
+    # Persist an exact copy rather than relying on a .nemo extraction folder
+    # or an old machine's tokenizer path for a future .ckpt resume.
+    if continuing and init_from_nemo:
+        active_tokenizer_dir = persist_tokenizer(model.tokenizer, os.path.join(checkpoint_dir, "tokenizer"))
+
+    if saved_optimizer_groups is not None:
+        validate_optimizer_group_names(
+            optimizer_parameter_groups(model, lr, encoder_lr_scale), saved_optimizer_groups)
+
+    tokenizer_report = {
+        "train": diagnose_tokenizer(model.tokenizer, train_texts),
+        "validation": diagnose_tokenizer(model.tokenizer, [entry["text"] for entry in read_manifest_entries(test_manifest)]),
+    }
+    with open(os.path.join(checkpoint_dir, "tokenizer_diagnostics.json"), "w", encoding="utf-8") as report:
+        json.dump(tokenizer_report, report, ensure_ascii=False, indent=2, allow_nan=False)
+        report.write("\n")
+    for split, metrics in tokenizer_report.items():
+        log(f"Tokenizer {split}: tokens/word={metrics['tokens_per_word']}, byte rate={metrics['byte_fallback_rate']}, unknown rate={metrics['unknown_rate']}, roundtrip mismatches={metrics['roundtrip_mismatches']}")
+        if metrics["unknown_tokens"] or metrics["roundtrip_mismatches"]:
+            warn(f"Tokenizer {split} has coverage/roundtrip issues; inspect tokenizer_diagnostics.json")
 
     num_prompts = int(
         model.cfg.get(
@@ -878,6 +973,7 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     model.cfg.train_ds.max_duration = max_duration
     # A retained fixed batch_size would cap the duration-based batch budget.
     model.cfg.train_ds.batch_size = None
+    model.cfg.train_ds.bucket_batch_size = None
     model.cfg.train_ds.batch_duration = batch_duration
     model.cfg.train_ds.initialize_prompt_feature = True
     model.cfg.train_ds.prompt_dictionary = OmegaConf.create(prompt_dictionary)
@@ -896,6 +992,7 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
     model.cfg.validation_ds.pin_memory = True
     # Validation avoids gradient storage, so a larger batch remains practical.
     model.cfg.validation_ds.batch_size = validation_batch_size
+    model.cfg.validation_ds.bucket_batch_size = None
     model.cfg.validation_ds.batch_duration = None
     model.cfg.validation_ds.max_duration = max_duration
     model.cfg.validation_ds.initialize_prompt_feature = True
@@ -920,9 +1017,16 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
                 "tokenizer_mode": tokenizer_mode,
                 "tokenizer_dir": active_tokenizer_dir,
                 "tokenizer_vocab_size": tokenizer_vocab_size,
+                "tokenizer_sha256": file_sha256(os.path.join(active_tokenizer_dir, "tokenizer.model"))
+                    if active_tokenizer_dir and os.path.isfile(os.path.join(active_tokenizer_dir, "tokenizer.model")) else None,
+                "configured_rnnt_loss_restored": True,
+                "resume_from": resume_from,
+                "init_from_nemo": init_from_nemo,
                 "prompt_index": selected_prompt_index,
                 "train_manifest": os.path.abspath(train_manifest),
                 "validation_manifest": os.path.abspath(test_manifest),
+                "train_manifest_sha256": file_sha256(train_manifest),
+                "validation_manifest_sha256": file_sha256(test_manifest),
                 "max_duration": max_duration,
                 "batch_duration": batch_duration,
                 "train_workers": train_workers,
@@ -1081,7 +1185,8 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         )
 
         log(f"\nStarting fine-tuning ({epochs} epochs, Noam scale={lr}) ...\n")
-        trainer.fit(model, train_dataloaders=train_dl, val_dataloaders=val_dl)
+        trainer.fit(model, train_dataloaders=train_dl, val_dataloaders=val_dl,
+                    ckpt_path=resume_from)
     # ------------------------------------------------------------------
     # Convert top-3 best checkpoints (lowest WER) to .nemo
     # ------------------------------------------------------------------
@@ -1102,9 +1207,17 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
         # (tokenizer artifact registration needs nemo_file_folder).
         final_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
+        export_rank = 0
         for rank, (ckpt_path, wer_val) in enumerate(sorted_best, start=1):
+            if not os.path.isfile(ckpt_path):
+                relocated = os.path.join(checkpoint_dir, os.path.basename(ckpt_path))
+                if not os.path.isfile(relocated):
+                    warn(f"Saved best checkpoint is unavailable: {ckpt_path}; skipping export")
+                    continue
+                ckpt_path = relocated
+            export_rank += 1
             wer_str = f"{wer_val:.4f}" if wer_val is not None else "wer-unknown"
-            nemo_name = f"nemotron-asr-best{rank}-wer-{wer_str}.nemo"
+            nemo_name = f"nemotron-asr-best{export_rank}-wer-{wer_str}.nemo"
             nemo_path = os.path.join(checkpoint_dir, nemo_name)
 
             log(f"  Best #{rank} (WER={wer_str}): loading {os.path.basename(ckpt_path)} ...")
@@ -1115,12 +1228,12 @@ def run_training(train_manifest: str, test_manifest: str, epochs: int = 20,
             sd = ckpt_data["state_dict"]
 
             # Lightning prefixes keys with "model." — strip if present
-            if any(k.startswith("model.") for k in sd):
+            if sd and all(k.startswith("model.") for k in sd):
                 sd = {k[len("model."):]: v for k, v in sd.items()}
             model.load_state_dict(sd)
 
             model.save_to(nemo_path)
-            if rank == 1:
+            if best_nemo_path is None:
                 best_nemo_path = nemo_path
             log(f"    -> Saved: {nemo_path}")
 
@@ -1212,6 +1325,7 @@ def run_evaluation(test_manifest: str, language: str | None = None,
         ).strip()
         records.append({
             "audio_filepath": audio_path,
+            "source_dataset": entry.get("source_dataset") or "unknown",
             "duration": float(entry["duration"]),
             "reference": ref_text,
             "hypothesis": hyp_text,
@@ -1225,7 +1339,7 @@ def run_evaluation(test_manifest: str, language: str | None = None,
         "checkpoint": nemo_file,
         "manifest": str(Path(test_manifest).resolve()),
         "language": language,
-        "normalization": "NFC and whitespace only; case and punctuation retained; CER includes spaces",
+        "normalization": "Strict: NFC and whitespace only; case and punctuation retained; CER includes spaces. Companion punctuation_insensitive: Unicode punctuation becomes spaces, then whitespace is collapsed; spelling is unchanged.",
         **summarize_scores(records),
     }
     with open(report_path / "transcriptions.jsonl", "w", encoding="utf-8") as f:
@@ -1317,6 +1431,10 @@ def main():
     parser.add_argument("--checkpoint", help="Specific .nemo archive for --evaluate")
     parser.add_argument("--eval-manifest", help="Reference manifest for --evaluate; defaults to test_manifest.json")
     parser.add_argument("--report-dir", help="Directory for evaluation JSON/JSONL reports")
+    continuation = parser.add_mutually_exclusive_group()
+    continuation.add_argument("--resume-from", help="Resume a .ckpt with saved optimizer/scheduler/epoch state; --epochs is the total target")
+    continuation.add_argument("--init-from-nemo", help="Start a new stage from fine-tuned .nemo weights, retaining tokenizer/prompt; requires --peak-lr")
+    parser.add_argument("--tokenizer-dir", help="Exact original BPE directory when relocating a --resume-from checkpoint")
     parser.add_argument("--apply-speechhints", action="store_true",
                         help="Post-process manifests with speech-hint grammars")
     parser.add_argument(
@@ -1361,11 +1479,13 @@ def main():
                         help=f"Training random seed (default: {RANDOM_SEED})")
     parser.add_argument("--encoder-lr-scale", type=float, default=1.0,
                         help="Encoder LR relative to decoder/joint LR, in (0, 1]; default: 1")
-    parser.add_argument("--lr", type=float, default=0.1,
+    rates = parser.add_mutually_exclusive_group()
+    rates.add_argument("--lr", type=float, default=0.1,
                         help=(
                             "Noam learning-rate scale factor, not the raw AdamW LR "
                             "(default: 0.1, per NVIDIA tutorial)"
                         ))
+    rates.add_argument("--peak-lr", type=float, help="Actual peak decoder/joint LR; converted to the equivalent Noam scale (alternative to --lr)")
     parser.add_argument(
         "--warmup-steps",
         type=int,
@@ -1458,6 +1578,20 @@ def main():
 
     if (args.checkpoint or args.eval_manifest) and not args.evaluate:
         parser.error("--checkpoint and --eval-manifest are only used with --evaluate")
+    if (args.resume_from or args.init_from_nemo or args.tokenizer_dir) and not args.train_only:
+        parser.error("Checkpoint continuation options require --train-only")
+    if args.tokenizer_dir and not args.resume_from:
+        parser.error("--tokenizer-dir requires --resume-from")
+    if args.init_from_nemo and args.peak_lr is None:
+        parser.error("--init-from-nemo requires --peak-lr for its new optimization stage")
+    if args.resume_from:
+        restored_flags = {"--lr", "--peak-lr", "--encoder-lr-scale", "--warmup-steps",
+                          "--noam-d-model", "--batch-duration", "--max-duration",
+                          "--seed", "--tokenizer-mode", "--tokenizer-vocab-size"}
+        supplied = {arg.split("=", 1)[0] for arg in sys.argv[1:]}
+        conflicts = restored_flags & supplied
+        if conflicts:
+            parser.error(f"Resume restores {', '.join(sorted(conflicts))} from the checkpoint; omit these flags or use --init-from-nemo for a new stage")
     if not args.wandb and (args.wandb_project is not None or args.wandb_entity is not None or args.wandb_offline):
         parser.error("--wandb-project, --wandb-entity, and --wandb-offline require --wandb")
     if args.wandb and any([args.convert_only, args.manifest_only, args.evaluate, args.apply_speechhints]):
@@ -1515,6 +1649,7 @@ def main():
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
             wandb_offline=args.wandb_offline,
+            peak_lr=args.peak_lr,
         )
 
         log("\n>>> Step 4: Evaluating model ...")
@@ -1573,6 +1708,10 @@ def main():
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
             wandb_offline=args.wandb_offline,
+            resume_from=args.resume_from,
+            init_from_nemo=args.init_from_nemo,
+            tokenizer_dir=args.tokenizer_dir,
+            peak_lr=args.peak_lr,
         )
         return
 

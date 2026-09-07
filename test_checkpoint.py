@@ -12,6 +12,7 @@ Run on the Linux training server, for example:
     python test_checkpoint.py sample2.mp3
     python test_checkpoint.py --device cuda
     python test_checkpoint.py sample2.mp3 --checkpoint /path/to/model.ckpt
+    python test_checkpoint.py sample2.mp3 --decoding-strategy beam --beam-size 4
 """
 
 from __future__ import annotations
@@ -237,7 +238,81 @@ def configure_language_prompt(model, language: str, requested_index: int | None)
     return selected_index
 
 
-def parse_args() -> argparse.Namespace:
+def checkpoint_config_value(checkpoint: dict, key: str):
+    """Read a saved setting without mutating or detaching unresolved references."""
+    from omegaconf import OmegaConf
+
+    hyper_parameters = checkpoint.get("hyper_parameters", {})
+    if not isinstance(hyper_parameters, dict):
+        return None
+    for config_key in ("cfg", "model_cfg"):
+        cfg = hyper_parameters.get(config_key)
+        if cfg is None:
+            continue
+        if not OmegaConf.is_config(cfg):
+            cfg = OmegaConf.create(cfg)
+        value = OmegaConf.select(cfg, key)
+        if value is not None:
+            if OmegaConf.is_config(value):
+                return OmegaConf.create(OmegaConf.to_container(value, resolve=True))
+            return value
+    return None
+
+
+def configure_decoding(
+    model, checkpoint: dict, strategy: str = "checkpoint", beam_size: int | None = None,
+) -> str:
+    """Restore saved RNNT decoding, then apply an explicitly requested experiment.
+
+    Updating cfg alone does not rebuild NeMo's live decoder. Use its public
+    change_decoding_strategy API after the custom vocabulary has been installed.
+    """
+    from omegaconf import OmegaConf, open_dict
+
+    if strategy not in ("checkpoint", "greedy", "greedy_batch", "beam"):
+        raise ValueError(f"Unsupported --decoding-strategy: {strategy}")
+    if beam_size is not None:
+        if not isinstance(beam_size, int) or isinstance(beam_size, bool) or beam_size < 1:
+            raise ValueError("--beam-size must be a positive integer")
+        if strategy != "beam":
+            raise ValueError("--beam-size requires --decoding-strategy beam")
+
+    saved_cfg = checkpoint_config_value(checkpoint, "decoding")
+    if saved_cfg is None and strategy == "checkpoint":
+        return str(model.cfg.decoding.strategy)
+
+    source_cfg = saved_cfg if saved_cfg is not None else model.cfg.decoding
+    decoding_cfg = OmegaConf.create(OmegaConf.to_container(source_cfg, resolve=True))
+    with open_dict(decoding_cfg):
+        if strategy != "checkpoint":
+            decoding_cfg.strategy = strategy
+        if strategy == "beam":
+            if decoding_cfg.get("beam") is None:
+                decoding_cfg.beam = {}
+            with open_dict(decoding_cfg.beam):
+                decoding_cfg.beam.beam_size = 4 if beam_size is None else beam_size
+                decoding_cfg.beam.return_best_hypothesis = True
+
+    model.change_decoding_strategy(decoding_cfg)
+    return str(model.cfg.decoding.strategy)
+
+
+def best_transcription(decoded) -> str:
+    """Accept NeMo's best-only, N-best, and older tuple return formats."""
+    hypotheses = decoded[0] if isinstance(decoded, tuple) else decoded
+    if not hypotheses:
+        return ""
+    hypothesis = hypotheses[0]
+    if hasattr(hypothesis, "n_best_hypotheses"):
+        hypothesis = hypothesis.n_best_hypotheses
+    if isinstance(hypothesis, list):
+        if not hypothesis:
+            return ""
+        hypothesis = hypothesis[0]
+    return hypothesis.text if hasattr(hypothesis, "text") else str(hypothesis)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Transcribe test_files/ audio with the best custom-language checkpoint."
     )
@@ -279,7 +354,24 @@ def parse_args() -> argparse.Namespace:
         default=DEVICE,
         help=f"Inference device (default: {DEVICE})",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--decoding-strategy",
+        choices=("checkpoint", "greedy", "greedy_batch", "beam"),
+        default="checkpoint",
+        help="Decoding strategy (default: restore the checkpoint's saved settings)",
+    )
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        help="Number of hypotheses to explore with --decoding-strategy beam (default: 4)",
+    )
+    args = parser.parse_args(argv)
+    if args.beam_size is not None:
+        if args.beam_size < 1:
+            parser.error("--beam-size must be a positive integer")
+        if args.decoding_strategy != "beam":
+            parser.error("--beam-size requires --decoding-strategy beam")
+    return args
 
 
 def main() -> None:
@@ -384,6 +476,11 @@ def main() -> None:
         }
 
     model.load_state_dict(state_dict, strict=True)
+    strategy = configure_decoding(model, checkpoint, args.decoding_strategy, args.beam_size)
+    print(f"Decoding strategy      : {strategy}")
+    if strategy == "beam":
+        print(f"Beam size              : {model.cfg.decoding.beam.beam_size}")
+        print("Beam search considers more alternatives and can be much slower on long audio.")
     del state_dict, checkpoint
     gc.collect()
 
@@ -418,13 +515,7 @@ def main() -> None:
                 return_hypotheses=True,
             )
 
-        # Some NeMo versions return (best_hypotheses, all_hypotheses).
-        hypotheses = decoded[0] if isinstance(decoded, tuple) else decoded
-        if not hypotheses:
-            transcription = ""
-        else:
-            hypothesis = hypotheses[0]
-            transcription = hypothesis.text if hasattr(hypothesis, "text") else str(hypothesis)
+        transcription = best_transcription(decoded)
 
         print("-" * 80)
         print(f"TRANSCRIPTION: {audio_path.name}")

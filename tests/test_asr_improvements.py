@@ -144,6 +144,8 @@ class TrainingSetupTests(unittest.TestCase):
         model = SimpleNamespace(
             encoder=SimpleNamespace(parameters=lambda: iter([encoder])),
             parameters=lambda: iter([encoder, decoder, prompt, frozen]),
+            named_parameters=lambda: iter([("encoder.weight", encoder), ("decoder.weight", decoder),
+                                          ("prompt.weight", prompt), ("frozen", frozen)]),
         )
         groups = optimizer_parameter_groups(model, 0.1, 0.1)
         self.assertAlmostEqual(groups[0]["lr"], 0.01)

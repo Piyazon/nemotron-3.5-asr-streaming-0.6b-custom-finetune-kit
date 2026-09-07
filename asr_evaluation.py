@@ -1,4 +1,4 @@
-"""Deletion diagnostics using word/character edit alignments from JiWER."""
+"""Strict and punctuation-insensitive ASR diagnostics from JiWER alignments."""
 
 import unicodedata
 
@@ -8,13 +8,33 @@ def normalize_for_scoring(text: str) -> str:
     return " ".join(unicodedata.normalize("NFC", text).split())
 
 
-def score_transcription(reference: str, hypothesis: str) -> dict:
+def normalize_without_punctuation(text: str) -> str:
+    """Replace Unicode punctuation with spaces without changing spelling or case."""
+    text = unicodedata.normalize("NFC", text)
+    return " ".join(
+        "".join(" " if unicodedata.category(char).startswith("P") else char for char in text).split()
+    )
+
+
+def _score_normalized_text(reference: str, hypothesis: str) -> dict:
     from jiwer import process_characters, process_words
 
-    reference = normalize_for_scoring(reference)
-    hypothesis = normalize_for_scoring(hypothesis)
+    # A punctuation-only reference has no words after secondary normalization.
+    # Keep its insertions for corpus totals, with undefined per-sample rates.
+    # Handle explicitly for JiWER 3.x, which rejects an empty reference.
     if not reference:
-        raise ValueError("Evaluation reference must contain transcript text")
+        return {
+            "wer": None,
+            "cer": None,
+            "reference_words": 0,
+            "reference_characters": 0,
+            "substitutions": 0,
+            "deletions": 0,
+            "insertions": len(hypothesis.split()),
+            "character_errors": len(hypothesis),
+            "deletion_rate": None,
+            "deleted_spans": [],
+        }
     words = process_words(reference, hypothesis)
     characters = process_characters(reference, hypothesis)
     reference_words = len(words.references[0])
@@ -37,8 +57,20 @@ def score_transcription(reference: str, hypothesis: str) -> dict:
     }
 
 
-def aggregate_scores(records: list[dict]) -> dict:
-    """Compute corpus rates from total edit counts, not mean utterance WER."""
+def score_transcription(reference: str, hypothesis: str) -> dict:
+    """Keep strict scores and add secondary scores that ignore punctuation only."""
+    strict_reference = normalize_for_scoring(reference)
+    strict_hypothesis = normalize_for_scoring(hypothesis)
+    if not strict_reference:
+        raise ValueError("Evaluation reference must contain transcript text")
+    result = _score_normalized_text(strict_reference, strict_hypothesis)
+    result["punctuation_insensitive"] = _score_normalized_text(
+        normalize_without_punctuation(reference), normalize_without_punctuation(hypothesis),
+    )
+    return result
+
+
+def _aggregate_counts(records: list[dict]) -> dict:
     fields = (
         "reference_words", "reference_characters", "substitutions",
         "deletions", "insertions", "character_errors",
@@ -55,6 +87,17 @@ def aggregate_scores(records: list[dict]) -> dict:
     }
 
 
+def aggregate_scores(records: list[dict]) -> dict:
+    """Compute corpus rates from total edit counts, not mean utterance WER."""
+    result = _aggregate_counts(records)
+    result["punctuation_insensitive"] = _aggregate_counts([
+        record["punctuation_insensitive"]
+        for record in records
+        if isinstance(record.get("punctuation_insensitive"), dict)
+    ])
+    return result
+
+
 def summarize_scores(records: list[dict]) -> dict:
     summary = aggregate_scores(records)
     summary["by_duration"] = {
@@ -64,4 +107,13 @@ def summarize_scores(records: list[dict]) -> dict:
             ("20_to_40s", 20, 40), ("40s_and_over", 40, float("inf")),
         )
     }
+    if any("source_dataset" in record for record in records):
+        sources = {}
+        for record in records:
+            source = str(record.get("source_dataset") or "unknown").strip() or "unknown"
+            sources.setdefault(source, []).append(record)
+        summary["by_source"] = {
+            source: aggregate_scores(source_records)
+            for source, source_records in sorted(sources.items())
+        }
     return summary

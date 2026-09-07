@@ -179,6 +179,7 @@ steps), the effective peak learning rate is approximately `3.1e-4`.
 |------|---------|-------------|
 | `--epochs` | 20 | Maximum training epochs (for full training) |
 | `--lr` | 0.1 | Noam learning-rate scale factor (not raw AdamW LR) |
+| `--peak-lr` | none | Actual peak decoder/joint LR; alternative to `--lr`, converted to the equivalent Noam scale |
 | `--encoder-lr-scale` | 1.0 | Encoder learning rate relative to the decoder/joint rate; use 0.1 to experiment with slower acoustic updates |
 | `--seed` | 42 | Seed for model initialization and data loading; GPU kernels can still be nondeterministic |
 | `--warmup-steps` | 100 | Noam linear warmup steps |
@@ -199,6 +200,9 @@ steps), the effective peak learning rate is approximately `3.1e-4`.
 | `--tokenizer-mode` | `auto` | Choose `auto`, `base`, or `custom` |
 | `--tokenizer-vocab-size` | 2048 | Requested generated BPE size (minimum 512) |
 | `--prompt-index` | first unused | Optional explicit unused prompt slot |
+| `--resume-from` | none | Continue a new-format `.ckpt` with saved training state; requires `--train-only` |
+| `--init-from-nemo` | none | Start a new optimization stage from a fine-tuned `.nemo`, preserving tokenizer and language prompt; requires `--peak-lr` and `--train-only` |
+| `--tokenizer-dir` | recorded directory | Exact original tokenizer directory if a resume checkpoint has moved |
 
 Tokenizer modes:
 
@@ -303,8 +307,9 @@ and tokenizer vocabulary size are not changed by this throughput profile.
 
 The logging interval controls training metrics. Reference/prediction examples
 may still appear in bursts from RNNT sub-batches and during validation. Changes
-take effect on the next process launch. This training entry point starts from
-the pretrained model; rerunning it does not resume the currently running job.
+take effect on the next process launch. By default, this training entry point
+starts from the pretrained model. See the continuation options below to load
+saved training state or start a new stage from fine-tuned weights.
 
 **Saved checkpoints:**
 
@@ -339,8 +344,8 @@ python asr_finetune_with_speechhints.py --train-only \
 ```
 
 Use `--wandb-entity your-team` to select a team. The W&B run display name comes
-from `--run-name`; each launch normally creates a new W&B run. This does not add
-training checkpoint resume support or attach to an already-running process.
+from `--run-name`; each launch normally creates a new W&B run, including when
+resuming a training checkpoint. It does not attach to an already-running process.
 
 The integration uses Lightning's [WandbLogger](https://docs.wandb.ai/models/integrations/lightning)
 to record NeMo's training loss and batch WER, learning rates, epoch/global step,
@@ -406,29 +411,103 @@ to test the newest retained weights, or `--checkpoint /path/to/model.ckpt` to
 choose explicitly. A missing best checkpoint or missing selection metadata
 requires an explicit selection; it does not silently fall back to another model.
 
-### Investigating skipped speech
+### Fresh Uyghur training recipe
+
+The revised fresh Uyghur recipe is saved in `train.sh`. Run it on the Linux
+training host from this repository with the training environment active:
+
+```bash
+bash train.sh
+```
+
+It uses the existing `custom_asr_data/train_manifest.json` and
+`custom_asr_data/test_manifest.json`, a custom 2,048-token vocabulary, 50 epochs,
+Noam scale 0.1 with 100 warmup steps, encoder LR scale 0.3, a 1,920-second audio
+batch, RNNT internal batch 64, and run name `uyghur-arabic-v2-enc03`. The peak
+decoder/joint LR is `3.125e-4`; the encoder peak is `9.375e-5`. The encoder rate
+is an experiment, not a guaranteed WER improvement. To repeat with a separate
+run name, use `bash train.sh --run-name another-name`. A fresh run refuses to
+reuse a directory containing model checkpoints.
+
+Vocabulary replacement can reset NeMo's live RNNT loss to defaults. The script
+now restores the configured backend, FastEmit/clamp options, reduction, and fused
+loss reference after replacement. It also clears inherited fixed bucket batch
+sizes so the requested duration budget actually controls batching.
+
+At startup, `tokenizer_diagnostics.json` records train/validation token counts,
+tokens per word, byte fallback and unknown rates, and Unicode/whitespace-normalized
+roundtrip mismatches. These measurements help investigate vocabulary size without
+changing the tokenizer during the experiment.
+
+### Continuing training
+
+For checkpoints produced by the revised code, resume into the original checkpoint
+directory. The epoch limit is the **total target**, not additional epochs:
+
+```bash
+python asr_finetune_with_speechhints.py --train-only --language ug-CN \
+  --resume-from checkpoints/FastConformer-Transducer-BPE-Prompt-Streaming/test/uyghur-arabic-v2-enc03/last.ckpt \
+  --epochs 60 --train-workers 32 --validation-workers 16 \
+  --validation-batch-size 16 --fused-batch-size 64 \
+  --wandb --wandb-project nemotron-uyghur
+```
+
+Resume restores weights, Adam state, Noam schedule, epoch/global step, tokenizer,
+encoder LR scale, duration budget, duration filter, and seed. Optimizer groups
+are sorted by parameter name and their names are saved and checked, preventing
+vocabulary replacement's module reordering from attaching Adam state to the
+wrong parameters. Tokenizer bytes, vocabulary order and manifest fingerprints
+are checked too. GPU kernels and data-loader sampling are not guaranteed to
+reproduce the exact uninterrupted sample order.
+
+Older checkpoints lack the optimizer parameter-name mapping. Export an older
+checkpoint with `export_checkpoint_to_nemo.py`, then start a **new stage** from
+its weights with an explicitly chosen peak LR, for example:
+
+```bash
+python asr_finetune_with_speechhints.py --train-only --language ug-CN \
+  --init-from-nemo /path/to/best-model.nemo \
+  --peak-lr 2e-5 --encoder-lr-scale 0.3 --warmup-steps 100 \
+  --epochs 10 --max-duration 70 --batch-duration 1920 --fused-batch-size 64 \
+  --train-workers 32 --validation-workers 16 --validation-batch-size 16 \
+  --run-name uyghur-arabic-refine --wandb --wandb-project nemotron-uyghur
+```
+
+This starts a new optimizer/scheduler and epoch count while retaining the learned
+decoder, tokenizer and prompt. It does not rebuild vocabulary from new text.
+The exact tokenizer is saved into the new run directory for later resume.
+The learning rate above is a trial setting; select it using held-out validation.
+
+### Comparing decoding and scoring
+
+`test_checkpoint.py` restores the checkpoint's saved decoding configuration by
+default. Compare the same checkpoint and recording with explicit beam search:
+
+```bash
+python test_checkpoint.py sample2.mp3 --run-name uyghur-arabic-v2-enc03
+python test_checkpoint.py sample2.mp3 --run-name uyghur-arabic-v2-enc03 \
+  --decoding-strategy beam --beam-size 4
+python test_checkpoint.py sample2.mp3 --run-name uyghur-arabic-v2-enc03 \
+  --decoding-strategy beam --beam-size 8
+```
+
+Beam search is an inference experiment and may trade speed for accuracy. It
+does not change training. Evaluation reports retain strict WER/CER and add
+punctuation-insensitive companion scores and source-dataset breakdowns; the
+companion normalization replaces punctuation with spaces without changing
+spellings or training transcripts.
 
 First evaluate the existing best model and inspect recordings with high deletion
 rates. Compare the same audio in NeMo and in the deployed runtime, with the same
 checkpoint and `ug-CN` prompt. For a missing passage, also try a separate crop
 that includes some surrounding speech.
 
-For the next controlled training experiment, a smaller encoder learning rate
-lets the randomly initialized decoder/joint learn faster relative to the
-pretrained acoustic encoder:
-
-```bash
-python asr_finetune_with_speechhints.py --train-only \
-  --language ug-CN --tokenizer-mode custom \
-  --encoder-lr-scale 0.1 --seed 42 --run-name uyghur-slower-encoder
-```
-
-Compare this with `--encoder-lr-scale 1.0` using the same data, seed and epoch
-budget in a separate run. The existing default remains 1.0. With the default
-Noam settings, scale 0.1 gives an encoder peak LR of approximately `3.1e-5` and
-a decoder/joint peak LR of `3.1e-4`. Both groups use the existing Noam schedule;
-the encoder continues training throughout. This is an experiment, not a
-confirmed remedy for omissions.
+The fresh recipe uses `--encoder-lr-scale 0.3` so the newly initialized
+decoder/joint learns faster relative to the pretrained acoustic encoder.
+Both groups use the same Noam schedule, and the encoder keeps training.
+For an encoder-rate comparison, use `bash train.sh --encoder-lr-scale 1.0
+--run-name uyghur-arabic-v2-enc10` with the same data, seed and epoch budget.
+The underlying Python CLI default remains 1.0.
 
 Before extending training, listen to samples while reading the exact manifest
 transcripts. Check that all spoken phrases are transcribed and that augmentations
@@ -440,11 +519,12 @@ for checkpoint selection, so that manifest serves as validation data. Review bot
 WER and deletion rate; reducing deletions while greatly increasing insertions is
 not an improvement.
 
-Regression checks for selection, scoring and optimizer grouping can run without
-NeMo or a GPU:
+Most regression checks run without NeMo or a GPU. The optimizer continuation
+integration checks use CPU PyTorch, Lightning and NeMo when installed; the
+optional W&B integration test is disabled by default:
 
 ```bash
-python -m pip install 'jiwer>=3.1,<5'
+python -m pip install 'jiwer>=3.1,<5' omegaconf sentencepiece
 python -m unittest discover -s tests -v
 ```
 

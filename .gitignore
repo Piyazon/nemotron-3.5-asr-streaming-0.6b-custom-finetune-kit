@@ -224,3 +224,5 @@ pretrained_model/
 test_files/
 
 .DS_Store
+
+small_dataset/
