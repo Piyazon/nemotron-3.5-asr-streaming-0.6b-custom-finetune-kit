@@ -96,7 +96,8 @@ The Noam scale `2.0` is **not** a raw constant AdamW learning rate. Its nominal
 peak is `2 / sqrt(1024 * 2000)`, approximately **0.00140**. The tutorial stops at
 the warmup boundary; this is its short demonstration recipe, not a converged
 Uyghur training schedule. Change `nvidia_recipe.yaml` explicitly for a later
-schedule experiment. Optional batch and worker flags are described below.
+schedule experiment. `--max-steps` can extend the run while keeping the
+2,000-update warmup. Optional batch and worker flags are described below.
 
 The acoustic architecture and initial encoder weights come from the `.nemo`.
 As in the tutorial, changing vocabulary rebuilds the RNNT prediction decoder
@@ -155,7 +156,71 @@ experiment. The duration sampler uses quadratic duration weighting, so the
 budget is not an exact total of raw audio seconds.
 
 These flags take effect on a new process launch. The command starts fresh from
-`--base-model`; it does not modify a running job or resume its optimizer state.
+`--base-model` unless `--resume-from` is supplied. Resume inherits the saved batch
+and worker settings, so omit batching overrides when continuing a checkpoint.
+
+## Train longer or continue a stopped run
+
+`--max-steps` is the **total optimizer-update target**, including updates already
+saved in a resumed checkpoint. NVIDIA's default remains 2,000 updates. With 200
+training batches per epoch and accumulation of 4, that is approximately 40 capped
+epochs. For example, 10,000 updates corresponds to approximately 200 capped epochs
+when each epoch reaches 200 batches. This is an example budget, not a guarantee
+of convergence or of seeing every recording. The 200-batch cap stays in place.
+
+Start a **fresh** longer experiment from the repository root:
+
+```bash
+bash exten_tokinizer_nvidia_style/train.sh \
+  --max-steps 10000 \
+  --fused-batch-size 8 --validation-batch-size 8 \
+  --wandb --wandb-project nemotron-uyghur \
+  --wandb-name ug-CN-10k \
+  --output-dir runs/ug-CN-10k
+```
+
+To **continue your existing training**, use its original run folder or an exact
+Lightning `.ckpt` path. After the original job finishes, for example:
+
+```bash
+bash exten_tokinizer_nvidia_style/train.sh \
+  --resume-from runs/ug-CN-wandb-fused8 \
+  --max-steps 10000 \
+  --wandb --wandb-project nemotron-uyghur \
+  --wandb-name ug-CN-continued-10k \
+  --output-dir runs/ug-CN-continued-10k
+```
+
+Replace the source folder if your original run has another name. A folder must
+contain exactly one `*-last.ckpt` (or `last.ckpt`); otherwise pass the precise
+checkpoint file. Paths in these shell commands are relative to this recipe
+folder, because `train.sh` changes directory. Prefer the last checkpoint to
+retain the latest completed updates. A checkpoint at step 2,000 continues for
+8,000 more updates when the total target is 10,000. The target must exceed the
+checkpoint's saved step count.
+
+Resume restores model weights, AdamW optimizer state, the Noam scheduler, and
+Lightning's training progress. It copies and verifies the exact saved tokenizer
+and prepared manifests rather than training another tokenizer. The original base
+`.nemo`, run configuration, metadata, prepared assets and referenced audio must
+remain available at their saved paths. Checkpoint tokenizer hashes, prompt mapping,
+and preparation fingerprint must match; incompatible checkpoints are rejected.
+`--prepare-only` can check the recipe/assets without CUDA; the binary checkpoint
+and optimizer state are checked when training restores them.
+
+Resume writes to a **fresh output directory**, preserving the source run. W&B
+creates a new run whose step counter continues from the checkpoint; its config
+records the source checkpoint. Checkpoint retention applies separately in each
+output directory. Do not pass data, tokenizer, prompt, or batching flags on resume;
+those settings are inherited from the saved recipe. A mid-epoch checkpoint can
+repeat some data depending on the installed sampler's resume support; this is not
+a guarantee of identical audio ordering to an uninterrupted run.
+
+Warmup remains 2,000 updates and is not restarted when resuming. Beyond warmup,
+Noam continues its inverse-square-root learning-rate decay. Raising this limit
+does not change an already running process. A `.nemo` export alone is not a full
+training checkpoint; passing it as `--base-model` would rebuild the decoder again
+and is not the way to continue your trained model.
 
 ## Weights & Biases
 
@@ -199,8 +264,8 @@ in `wandb_run.json` inside the checkpoint/log directory. `--prepare-only` record
 your W&B settings in the recipe without starting a W&B run.
 
 These flags apply on the next training launch; they do not attach to an already
-running job. Use a fresh output directory, since this launcher does not resume
-optimizer state. W&B is optional and disabled when `--wandb` is omitted.
+running job. Use a fresh output directory, including for an explicit checkpoint
+continuation. W&B is optional and disabled when `--wandb` is omitted.
 
 ## Outputs and inference
 
@@ -214,8 +279,9 @@ By default, outputs are under `exten_tokinizer_nvidia_style/runs/ug-CN-nvidia/`:
   configurations, and the explicit `nemotron-extended-final.nemo` export.
 
 An existing training directory is rejected. Use a new `--output-dir` for another
-run. This launcher starts fresh from `--base-model`; it does not resume optimizer
-state. Prepared assets are reusable, and their checksums are verified before use.
+run. This launcher starts fresh from `--base-model` by default; use `--resume-from`
+to restore training state. Prepared assets are reusable, and their checksums are
+verified before use.
 
 Transcribe with the saved `ug-CN` prompt on your CUDA machine:
 
@@ -234,5 +300,12 @@ Use identical tag stripping and scoring normalization for model comparisons.
 CPU regression checks:
 
 ```bash
-python -m unittest exten_tokinizer_nvidia_style.test_recipe exten_tokinizer_nvidia_style.test_tracking -v
+python -m unittest exten_tokinizer_nvidia_style.test_recipe exten_tokinizer_nvidia_style.test_tracking exten_tokinizer_nvidia_style.test_resume -v
+```
+
+With the full NeMo/Lightning dependencies installed, test a real CPU checkpoint
+continuation against uninterrupted AdamW/Noam training:
+
+```bash
+python -m unittest exten_tokinizer_nvidia_style.test_resume_integration -v
 ```

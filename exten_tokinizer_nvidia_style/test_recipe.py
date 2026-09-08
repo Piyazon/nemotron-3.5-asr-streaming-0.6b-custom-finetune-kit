@@ -180,6 +180,18 @@ class RecipeTests(unittest.TestCase):
         cfg, _ = build_recipe(base, Path("/assets"), Path("/run"), "ug-CN", fused_batch_size=8)
         self.assertTrue(cfg.model.joint.fuse_loss_wer)
 
+    def test_longer_run_keeps_warmup_batching_and_validation_schedule(self):
+        args = parser().parse_args(["--max-steps", "10000"])
+        original, _ = build_recipe(base_config(), Path("/assets"), Path("/run"), "ug-CN")
+        longer, _ = build_recipe(base_config(), Path("/assets"), Path("/run"), "ug-CN", max_steps=args.max_steps)
+        self.assertEqual(longer.trainer.max_steps, 10000)
+        self.assertEqual(longer.model, original.model)
+        longer.trainer.max_steps = original.trainer.max_steps
+        self.assertEqual(longer.trainer, original.trainer)
+        for value in (0, -1, 1.5, True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                build_recipe(base_config(), Path("/assets"), Path("/run"), "ug-CN", max_steps=value)
+
     def test_invalid_batch_overrides_fail_before_preparation(self):
         for flag, value in (("--batch-duration", "nan"), ("--batch-duration", "inf"),
                             ("--batch-duration", "0"), ("--fused-batch-size", "0"),

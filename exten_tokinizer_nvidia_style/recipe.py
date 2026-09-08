@@ -47,7 +47,8 @@ def allocate_prompt(base_cfg, language: str, requested_index: int | None = None)
 def build_recipe(base_cfg, assets: Path, output_dir: Path, language: str,
                  requested_index: int | None = None, *, batch_duration: float | None = None,
                  fused_batch_size: int | None = None, train_workers: int | None = None,
-                 validation_workers: int | None = None, validation_batch_size: int | None = None):
+                 validation_workers: int | None = None, validation_batch_size: int | None = None,
+                 max_steps: int | None = None):
     if batch_duration is not None and (
         isinstance(batch_duration, bool) or not math.isfinite(batch_duration) or batch_duration <= 0
     ):
@@ -57,6 +58,7 @@ def build_recipe(base_cfg, assets: Path, output_dir: Path, language: str,
         ("train_workers", train_workers, 0),
         ("validation_workers", validation_workers, 0),
         ("validation_batch_size", validation_batch_size, 1),
+        ("max_steps", max_steps, 1),
     ):
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < minimum):
             raise ValueError(f"{name} must be an integer >= {minimum}")
@@ -65,6 +67,8 @@ def build_recipe(base_cfg, assets: Path, output_dir: Path, language: str,
         OmegaConf.load(HERE / "upstream/fastconformer_transducer_bpe_streaming_prompt.yaml"),
         OmegaConf.load(HERE / "nvidia_recipe.yaml"),
     )
+    if max_steps is not None:
+        cfg.trainer.max_steps = max_steps
     mapping, index, num_prompts = allocate_prompt(base_cfg, language, requested_index)
     # The upstream finetune entry point restores architecture from .nemo. Do not
     # instantiate its example's 42-layer encoder instead of the 0.6B checkpoint.
