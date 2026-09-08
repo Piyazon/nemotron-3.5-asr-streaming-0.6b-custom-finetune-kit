@@ -5,6 +5,7 @@ Run from the repository root:
 """
 
 import copy
+from contextlib import redirect_stderr
 import io
 import json
 from pathlib import Path
@@ -18,6 +19,7 @@ import sentencepiece as spm
 from sentencepiece import sentencepiece_model_pb2 as pb
 
 from exten_tokinizer_nvidia_style.recipe import allocate_prompt, build_recipe, configure_model
+from exten_tokinizer_nvidia_style.train import parser
 from exten_tokinizer_nvidia_style.tokenizer import (
     merge_tokenizers, parse_model, prepare_assets, read_manifest, tag_transcript,
 )
@@ -29,6 +31,7 @@ def base_config():
         "model_defaults": {"prompt_dictionary": {"en-US": 0, "en": 0, "ms-MY": 2},
                            "num_prompts": 5, "enc_hidden": 1024, "pred_hidden": 640, "joint_hidden": 640},
         "encoder": {"d_model": 1024, "n_layers": 24, "subsampling_factor": 8},
+        "joint": {"fused_batch_size": 2, "fuse_loss_wer": True},
         "tokenizer": {"type": "bpe", "model_path": "nemo:abc_tokenizer.model"},
         "train_ds": {"prompt_dictionary": {"en-US": 0, "fr-FR": 1}},
         "validation_ds": {"prompt_dictionary": {"en-US": 0}},
@@ -91,6 +94,17 @@ class RecipeTests(unittest.TestCase):
         OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
 
     def test_prompt_mapping_and_provenance_survive_configuration_serialization(self):
+        class Joint:
+            fused_batch_size = 2
+            fuse_loss_wer = True
+
+            def set_fused_batch_size(self, value):
+                self.fused_batch_size = value
+
+            def set_fuse_loss_wer(self, value, loss, metric):
+                self.fuse_loss_wer = value
+                self.loss, self.metric = loss, metric
+
         class Model:
             def __init__(self):
                 self.cfg = base_config()
@@ -98,6 +112,8 @@ class RecipeTests(unittest.TestCase):
 
             def change_vocabulary(self, **kwargs):
                 self.calls.append(("vocabulary", kwargs))
+                self.joint = Joint()
+                self.loss, self.wer = object(), object()
 
             def setup_training_data(self, cfg):
                 self.cfg.train_ds = copy.deepcopy(cfg)
@@ -111,7 +127,7 @@ class RecipeTests(unittest.TestCase):
             def from_config_dict(self, cfg):
                 return cfg
 
-        cfg, index = build_recipe(base_config(), Path("/assets"), Path("/run"), "ug-CN")
+        cfg, index = build_recipe(base_config(), Path("/assets"), Path("/run"), "ug-CN", fused_batch_size=8)
         model = Model()
         configure_model(model, cfg, {
             "language": "ug-CN", "merged_vocab_size": 123,
@@ -124,8 +140,54 @@ class RecipeTests(unittest.TestCase):
             self.assertEqual(saved[section].prompt_dictionary["ms-MY"], 2)
         self.assertEqual(saved.custom_finetune.tokenizer_sha256, "merged")
         self.assertEqual(saved.custom_finetune.prompt_index, 3)
+        self.assertEqual(model.joint.fused_batch_size, 8)
+        self.assertEqual(saved.joint.fused_batch_size, 8)
+        self.assertEqual(saved.custom_finetune.fused_batch_size, 8)
+        self.assertEqual(saved.custom_finetune.batch_duration, 200)
+        self.assertTrue(model.joint.fuse_loss_wer)
+        self.assertIs(model.joint.loss, model.loss)
+        self.assertIs(model.joint.metric, model.wer)
         self.assertFalse(model.compute_eval_loss)
         self.assertEqual(model.calls[0][1]["new_tokenizer_type"], "bpe")
+
+    def test_cli_batch_overrides_preserve_optimizer_schedule_and_accumulation(self):
+        args = parser().parse_args([
+            "--batch-duration", "400", "--fused-batch-size", "8", "--train-workers", "16",
+            "--validation-workers", "4", "--validation-batch-size", "8",
+        ])
+        original, _ = build_recipe(base_config(), Path("/assets"), Path("/run"), "ug-CN")
+        cfg, _ = build_recipe(
+            base_config(), Path("/assets"), Path("/run"), "ug-CN",
+            **{key: getattr(args, key) for key in (
+                "batch_duration", "fused_batch_size", "train_workers", "validation_workers", "validation_batch_size")},
+        )
+        self.assertEqual(cfg.model.train_ds.batch_duration, 400)
+        self.assertEqual(cfg.model.joint.fused_batch_size, 8)
+        self.assertEqual(cfg.model.train_ds.num_workers, 16)
+        self.assertEqual(cfg.model.validation_ds.num_workers, 4)
+        self.assertEqual(cfg.model.validation_ds.batch_size, 8)
+        self.assertEqual(cfg.model.optim, original.model.optim)
+        self.assertEqual(cfg.trainer, original.trainer)
+        self.assertEqual(cfg.model.train_ds.max_duration, original.model.train_ds.max_duration)
+
+    def test_no_batch_overrides_preserves_base_joint_settings(self):
+        base = base_config()
+        base.joint.fused_batch_size = 4
+        base.joint.fuse_loss_wer = False
+        cfg, _ = build_recipe(base, Path("/assets"), Path("/run"), "ug-CN")
+        self.assertEqual(cfg.model.joint.fused_batch_size, 4)
+        self.assertFalse(cfg.model.joint.fuse_loss_wer)
+        cfg, _ = build_recipe(base, Path("/assets"), Path("/run"), "ug-CN", fused_batch_size=8)
+        self.assertTrue(cfg.model.joint.fuse_loss_wer)
+
+    def test_invalid_batch_overrides_fail_before_preparation(self):
+        for flag, value in (("--batch-duration", "nan"), ("--batch-duration", "inf"),
+                            ("--batch-duration", "0"), ("--fused-batch-size", "0"),
+                            ("--fused-batch-size", "2.5"), ("--train-workers", "-1"),
+                            ("--validation-workers", "-1"), ("--validation-batch-size", "0")):
+            with self.subTest(flag=flag, value=value), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parser().parse_args([flag, value])
+        self.assertEqual(parser().parse_args(["--train-workers", "0"]).train_workers, 0)
 
 
 class TokenizerTests(unittest.TestCase):

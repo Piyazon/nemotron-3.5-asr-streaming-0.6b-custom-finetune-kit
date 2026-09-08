@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from pathlib import Path
 
 from omegaconf import OmegaConf, open_dict
@@ -44,7 +45,21 @@ def allocate_prompt(base_cfg, language: str, requested_index: int | None = None)
 
 
 def build_recipe(base_cfg, assets: Path, output_dir: Path, language: str,
-                 requested_index: int | None = None):
+                 requested_index: int | None = None, *, batch_duration: float | None = None,
+                 fused_batch_size: int | None = None, train_workers: int | None = None,
+                 validation_workers: int | None = None, validation_batch_size: int | None = None):
+    if batch_duration is not None and (
+        isinstance(batch_duration, bool) or not math.isfinite(batch_duration) or batch_duration <= 0
+    ):
+        raise ValueError("batch_duration must be positive and finite")
+    for name, value, minimum in (
+        ("fused_batch_size", fused_batch_size, 1),
+        ("train_workers", train_workers, 0),
+        ("validation_workers", validation_workers, 0),
+        ("validation_batch_size", validation_batch_size, 1),
+    ):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < minimum):
+            raise ValueError(f"{name} must be an integer >= {minimum}")
     base_cfg = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
     cfg = OmegaConf.merge(
         OmegaConf.load(HERE / "upstream/fastconformer_transducer_bpe_streaming_prompt.yaml"),
@@ -57,6 +72,22 @@ def build_recipe(base_cfg, assets: Path, output_dir: Path, language: str,
     cfg.model.encoder = copy.deepcopy(base_cfg.encoder)
     cfg.model.model_defaults.prompt_dictionary = OmegaConf.create(mapping)
     cfg.model.model_defaults.num_prompts = num_prompts
+    # These live joint settings previously came directly from the restored
+    # checkpoint. Keep that behavior when no CLI override was requested.
+    base_joint = base_cfg.get("joint") or {}
+    for key in ("fused_batch_size", "fuse_loss_wer"):
+        cfg.model.joint[key] = base_joint.get(key, cfg.model.joint[key])
+    if fused_batch_size is not None:
+        cfg.model.joint.fused_batch_size = fused_batch_size
+        cfg.model.joint.fuse_loss_wer = True
+    for ds, key, value in (
+        (cfg.model.train_ds, "batch_duration", batch_duration),
+        (cfg.model.train_ds, "num_workers", train_workers),
+        (cfg.model.validation_ds, "num_workers", validation_workers),
+        (cfg.model.validation_ds, "batch_size", validation_batch_size),
+    ):
+        if value is not None:
+            ds[key] = value
     cfg.model.train_ds.manifest_filepath = str(assets / "train.jsonl")
     cfg.model.validation_ds.manifest_filepath = str(assets / "validation.jsonl")
     cfg.model.tokenizer.dir = str(assets / "merged_tokenizer")
@@ -81,7 +112,13 @@ def build_recipe(base_cfg, assets: Path, output_dir: Path, language: str,
 def configure_model(model, cfg, metadata: dict, prompt_index: int) -> None:
     """Update vocabulary, model config, and inference mapping before optimization."""
     model.change_vocabulary(new_tokenizer_dir=cfg.model.tokenizer.dir, new_tokenizer_type="bpe")
+    # change_vocabulary rebuilds the joint. Update its runtime attributes AFTER
+    # that rebuild as well as its saved config, so the CLI affects GPU batching.
+    model.joint.set_fused_batch_size(cfg.model.joint.fused_batch_size)
+    model.joint.set_fuse_loss_wer(cfg.model.joint.fuse_loss_wer, loss=model.loss, metric=model.wer)
     with open_dict(model.cfg):
+        model.cfg.joint.fused_batch_size = cfg.model.joint.fused_batch_size
+        model.cfg.joint.fuse_loss_wer = cfg.model.joint.fuse_loss_wer
         model.cfg.model_defaults.prompt_dictionary = copy.deepcopy(cfg.model.model_defaults.prompt_dictionary)
         model.cfg.model_defaults.num_prompts = cfg.model.model_defaults.num_prompts
         model.cfg.num_prompts = cfg.model.model_defaults.num_prompts
@@ -94,6 +131,8 @@ def configure_model(model, cfg, metadata: dict, prompt_index: int) -> None:
             "base_tokenizer_sha256": metadata["base_tokenizer_sha256"],
             "tokenizer_sha256": metadata["file_sha256"]["merged_tokenizer/tokenizer.model"],
             "assets_fingerprint": metadata["fingerprint"],
+            "batch_duration": cfg.model.train_ds.batch_duration,
+            "fused_batch_size": cfg.model.joint.fused_batch_size,
         })
     model.compute_eval_loss = bool(cfg.model.compute_eval_loss)
     # Like speech_to_text_finetune.py, retain the restored architecture and

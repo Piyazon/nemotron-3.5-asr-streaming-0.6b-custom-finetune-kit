@@ -96,7 +96,7 @@ The Noam scale `2.0` is **not** a raw constant AdamW learning rate. Its nominal
 peak is `2 / sqrt(1024 * 2000)`, approximately **0.00140**. The tutorial stops at
 the warmup boundary; this is its short demonstration recipe, not a converged
 Uyghur training schedule. Change `nvidia_recipe.yaml` explicitly for a later
-experiment; the launcher exposes no hidden hyperparameter overrides.
+schedule experiment. Optional batch and worker flags are described below.
 
 The acoustic architecture and initial encoder weights come from the `.nemo`.
 As in the tutorial, changing vocabulary rebuilds the RNNT prediction decoder
@@ -112,6 +112,95 @@ period receive no appended tag. Existing matching tags are not duplicated.
 The new tokenizer uses NeMo's Unigram builder defaults, including complete
 character coverage and case-folding, without enabling byte fallback. The
 merged tokenizer keeps the base tokenizer's normalization and byte settings.
+
+## Try larger batches on a 96 GB GPU
+
+The defaults still match NVIDIA's recipe. After updating the scripts on the
+training machine, start a separate experiment from the repository root:
+
+```bash
+bash exten_tokinizer_nvidia_style/train.sh \
+  --fused-batch-size 8 \
+  --validation-batch-size 8 \
+  --output-dir runs/ug-CN-fused8
+```
+
+`train.sh` changes into this folder, so this output path is under
+`exten_tokinizer_nvidia_style/runs/`. `--fused-batch-size` sets the number of clips
+processed together by the RNNT joint/loss. It is applied to the live joint after
+vocabulary replacement, and saved in the model configuration. This setting
+keeps the training audio batch and gradient accumulation unchanged. See
+[NeMo's batch-splitting explanation](https://docs.nvidia.com/nemo/speech/nightly/asr/configs.html#effect-of-fused-batch-step).
+
+Compare training steps per second and peak memory across short and long clips.
+A larger internal batch may improve throughput but needs measurement; higher
+memory occupancy alone does not establish a speedup. If 8 runs out of memory,
+try 4. If it improves speed with ample peak-memory headroom, try 16 in another
+run. No GPU speedup or memory requirement is guaranteed by this configuration.
+
+Other optional flags:
+
+| Flag | Effect when supplied | Default when omitted |
+| --- | --- | --- |
+| `--batch-duration 400` | Raises the dynamic training audio budget | 200 seconds |
+| `--fused-batch-size 8` | Raises the internal RNNT batch and enables fused loss/WER | Base `.nemo` setting |
+| `--train-workers 16` | Sets training loader processes | 8 |
+| `--validation-workers 4` | Sets validation loader processes | 2 |
+| `--validation-batch-size 8` | Sets validation clips per batch | 2 |
+
+Increase workers only if loading data is limiting throughput. Raising the audio
+budget changes how much data contributes to each optimizer update; accumulation
+stays at 4 and the learning-rate schedule is unchanged. It is a separate training
+experiment. The duration sampler uses quadratic duration weighting, so the
+budget is not an exact total of raw audio seconds.
+
+These flags take effect on a new process launch. The command starts fresh from
+`--base-model`; it does not modify a running job or resume its optimizer state.
+
+## Weights & Biases
+
+Enable W&B on the training server after logging into your account:
+
+```bash
+wandb login
+bash exten_tokinizer_nvidia_style/train.sh \
+  --wandb --wandb-project nemotron-uyghur \
+  --wandb-name ug-CN-unigram2048 \
+  --output-dir runs/ug-CN-wandb
+```
+
+You can combine these flags with the batch overrides above. Add
+`--wandb-entity YOUR_TEAM` for a team project. Without `--wandb-project`, the
+project defaults to `WANDB_PROJECT` or `nemotron-asr-finetune`. Without
+`--wandb-name`, the display name is the output directory name. Each launch gets
+a fresh W&B run ID, independent of NeMo's local `test` version directory.
+
+W&B receives the metrics emitted by NeMo through Lightning: `train_loss`,
+`training_batch_wer`, actual `learning_rate`, `val_wer`, step/epoch progress,
+and NeMo's step timings. W&B also collects system metrics, including GPU
+utilization and memory when supported on the training server. Run configuration
+includes optimizer/scheduler, batching, language/prompt mapping, vocabulary sizes,
+sample counts, tokenizer checksums, and aggregate unknown-token coverage. A small
+`run-metadata` artifact contains `training_recipe.yaml` and
+`preparation_summary.json`. The final summary records completion/failure status,
+completed optimizer steps, and best validation WER when available.
+
+NVIDIA's logging and validation intervals are unchanged: training metrics are
+logged every 100 optimizer steps, and validation runs halfway through and at the
+end of every 20th epoch. Validation WER appears only after validation runs.
+`compute_eval_loss` is false in this recipe, so there is no validation-loss curve.
+The model checkpoints, audio, transcripts, tokenizer binaries, and prediction
+console output stay local. TensorBoard remains enabled.
+
+For a server without network access, add `--wandb-offline` alongside `--wandb`.
+The launcher prints the exact `wandb sync ...` command to upload that run later.
+The run ID, local W&B directory, and dashboard URL (online runs) are also saved
+in `wandb_run.json` inside the checkpoint/log directory. `--prepare-only` records
+your W&B settings in the recipe without starting a W&B run.
+
+These flags apply on the next training launch; they do not attach to an already
+running job. Use a fresh output directory, since this launcher does not resume
+optimizer state. W&B is optional and disabled when `--wandb` is omitted.
 
 ## Outputs and inference
 
@@ -145,5 +234,5 @@ Use identical tag stripping and scoring normalization for model comparisons.
 CPU regression checks:
 
 ```bash
-python -m unittest exten_tokinizer_nvidia_style.test_recipe -v
+python -m unittest exten_tokinizer_nvidia_style.test_recipe exten_tokinizer_nvidia_style.test_tracking -v
 ```
