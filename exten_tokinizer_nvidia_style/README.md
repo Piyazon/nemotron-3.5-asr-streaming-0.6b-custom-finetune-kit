@@ -291,7 +291,21 @@ python exten_tokinizer_nvidia_style/transcribe.py \
   --language ug-CN path/to/audio.wav
 ```
 
-This convenience command uses `model.transcribe()`. For a streaming benchmark,
+To transcribe with a retained Lightning `.ckpt`, use the root checkpoint script
+from the repository root and pass the exact file path:
+
+```bash
+python test_checkpoint.py /workspace/sample2.wav \
+  --checkpoint /path/to/saved-model.ckpt \
+  --language ug-CN --device cuda
+```
+
+This reads the merged tokenizer path and language prompt from the checkpoint,
+including NeMo's OmegaConf checkpoint metadata. Keep the run's `assets/` folder
+available at the saved path. `transcribe.py` accepts `.nemo` archives with
+`--model`; `test_checkpoint.py` accepts `.ckpt` files with `--checkpoint`.
+
+`transcribe.py` uses `model.transcribe()`. For a streaming benchmark,
 use NeMo's `speech_to_text_cache_aware_streaming_infer.py` with the exported model,
 `target_lang=ug-CN`, `att_context_size=[56,3]`, `decoder_type=rnnt`,
 `pad_and_drop_preencoded=true`, and `batch_size=8`, as in the NVIDIA notebook.

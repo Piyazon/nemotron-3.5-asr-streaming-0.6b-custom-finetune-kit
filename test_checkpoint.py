@@ -18,6 +18,7 @@ Run on the Linux training server, for example:
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import gc
 import json
 import re
@@ -147,46 +148,18 @@ def find_latest_tokenizer(language: str) -> Path:
 
 def prompt_index_from_checkpoint(checkpoint: dict, language: str) -> int | None:
     """Read the language prompt index from checkpoint config when available."""
-    from omegaconf import OmegaConf
-
-    hyper_parameters = checkpoint.get("hyper_parameters", {})
-    if not isinstance(hyper_parameters, dict):
-        return None
-
-    for key in ("cfg", "model_cfg"):
-        cfg = hyper_parameters.get(key)
-        if cfg is None:
-            continue
-        try:
-            value = OmegaConf.select(cfg, f"model_defaults.prompt_dictionary.{language}")
-        except (AttributeError, TypeError, ValueError):
-            value = None
-        if value is not None:
-            return int(value)
-
-    return None
+    value = checkpoint_config_value(checkpoint, f"model_defaults.prompt_dictionary.{language}")
+    return int(value) if value is not None else None
 
 
 def tokenizer_dir_from_checkpoint(checkpoint: dict) -> Path | None:
     """Read the exact generated tokenizer path recorded during training."""
-    from omegaconf import OmegaConf
-
-    hyper_parameters = checkpoint.get("hyper_parameters", {})
-    if not isinstance(hyper_parameters, dict):
-        return None
-
-    for key in ("cfg", "model_cfg"):
-        cfg = hyper_parameters.get(key)
-        if cfg is None:
-            continue
-        try:
-            value = OmegaConf.select(cfg, "custom_finetune.tokenizer_dir")
-        except (AttributeError, TypeError, ValueError):
-            value = None
-        if value:
-            return resolve_path(str(value))
-
-    return None
+    value = checkpoint_config_value(checkpoint, "custom_finetune.tokenizer_dir")
+    if not value:
+        # NeMo also saves the directory installed by change_vocabulary here.
+        # Older training scripts may not have written custom_finetune metadata.
+        value = checkpoint_config_value(checkpoint, "tokenizer.dir")
+    return resolve_path(str(value)) if value else None
 
 
 def configure_language_prompt(model, language: str, requested_index: int | None) -> int:
@@ -243,11 +216,14 @@ def checkpoint_config_value(checkpoint: dict, key: str):
     from omegaconf import OmegaConf
 
     hyper_parameters = checkpoint.get("hyper_parameters", {})
-    if not isinstance(hyper_parameters, dict):
+    # Lightning preserves OmegaConf containers when saving NeMo hparams.
+    # DictConfig implements Mapping, but is not a Python dict. The nested cfg
+    # can independently be either a plain dict or a DictConfig.
+    if not isinstance(hyper_parameters, Mapping):
         return None
     for config_key in ("cfg", "model_cfg"):
         cfg = hyper_parameters.get(config_key)
-        if cfg is None:
+        if not isinstance(cfg, Mapping):
             continue
         if not OmegaConf.is_config(cfg):
             cfg = OmegaConf.create(cfg)
