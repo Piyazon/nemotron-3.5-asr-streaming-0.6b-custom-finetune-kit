@@ -19,7 +19,7 @@ HAS_AUDIO_LIBRARIES = all(
 
 @unittest.skipUnless(HAS_AUDIO_LIBRARIES, "Install datasets, numpy and soundfile for real audio checks")
 class PreparationAudioIntegrationTests(unittest.TestCase):
-    def test_multiprocess_export_preserves_audio_and_transcripts_for_both_sources(self):
+    def test_multiprocess_export_preserves_audio_and_transcripts(self):
         from datasets import Dataset
         import numpy as np
         import soundfile as sf
@@ -33,7 +33,7 @@ class PreparationAudioIntegrationTests(unittest.TestCase):
                     (0.25 * np.sin(2 * np.pi * (220 + source_index * 110) * np.arange(8000 + i * 800) / 16000)).astype(np.float32)
                     for i in range(4)
                 ]
-                texts = [f"مەن باردىم {i}" for i in range(4)]
+                texts = [f"مەن باردىم {i}." for i in range(4)]
                 ds = Dataset.from_dict({
                     "audio": [{"array": clip.tolist(), "sampling_rate": 16000} for clip in clips],
                     "sentence": texts,
@@ -65,8 +65,8 @@ class PreparationAudioIntegrationTests(unittest.TestCase):
             combined = root / "combined.jsonl"
             prepare.merge_manifests(parts, combined)
             rows = [json.loads(line) for line in combined.read_text().splitlines()]
-            self.assertEqual(len(rows), 8)
-            self.assertEqual(len({row["audio_filepath"] for row in rows}), 8)
+            self.assertEqual(len(rows), 4 * len(prepare.DATASET_IDS))
+            self.assertEqual(len({row["audio_filepath"] for row in rows}), len(rows))
             self.assertEqual({row["source_dataset"] for row in rows}, set(prepare.DATASET_IDS))
 
 

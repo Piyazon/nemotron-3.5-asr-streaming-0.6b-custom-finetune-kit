@@ -68,7 +68,7 @@ The exact tokenizer directory and prompt index are also recorded in every new
 Lightning checkpoint, so checkpoint export and testing no longer have to guess
 which same-sized tokenizer belongs to a checkpoint.
 
-For the two Hugging Face Uyghur datasets, prepare and train with:
+For the Hugging Face Common Voice Uyghur dataset, prepare and train with:
 
 ```bash
 python prepare_hf_uyghur_fast.py --format flac
@@ -79,20 +79,20 @@ python asr_finetune_with_speechhints.py \
   --run-name uyghur-v2
 ```
 
-The preparation script combines `piyazon/cv-corpus-ug-24-latn` and
-`piyazon/thuyg20-datasets`. It uses the Arabic-script `sentence` column from both
-repositories, sets the language to `ug-CN`, and exports the original clips
-without concatenation. It merges their training splits into
-`custom_asr_data/train_manifest.json` and their held-out splits into
+The preparation script uses only `piyazon/cv-corpus-ug-24-latn`. It reads the
+Arabic-script `sentence` column, preserves punctuation, sets the language to
+`ug-CN`, and exports the original clips without concatenation. It writes the
+training split into `custom_asr_data/train_manifest.json` and the held-out split into
 `custom_asr_data/test_manifest.json`, preferring `validation` over `test` when
-both exist. If a source has neither, it creates a seeded 98/2 row split for that
-source. The resulting manifests replace previous preparation results after both
-sources have exported successfully. Audio is stored separately by repository,
+both exist. If neither exists, it creates a seeded 98/2 row split. The resulting
+manifests replace previous preparation results after all splits export successfully.
+Rerun preparation to remove previously included THUYG-20 entries from the active
+manifests; cached audio from that dataset is no longer referenced. Audio is stored by repository,
 dataset fingerprint and split, preventing row-index collisions and stale reuse.
 
 The default maximum duration is 40 seconds. To include longer recordings, pass
 the same `--max-duration` value to preparation and training, for example `70`.
-The export log reports skipped clips and their reasons. Loading the repositories
+The export log reports skipped clips and their reasons. Loading the repository
 uses your existing Hugging Face login or `HF_TOKEN` when access is required.
 
 ---
@@ -268,7 +268,7 @@ does not bypass LR scheduling. Feeding raw `0.1` directly to AdamW is incorrect
 for this recipe.
 
 The 96 GB defaults are a starting configuration, not a measured maximum. For the
-combined Uyghur dataset with clips up to about 65 seconds, start a new run with:
+custom dataset with clips up to about 65 seconds, start a new run with:
 
 ```bash
 python asr_finetune_with_speechhints.py --train-only \

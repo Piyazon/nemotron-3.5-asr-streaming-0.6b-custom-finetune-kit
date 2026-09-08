@@ -1,0 +1,28 @@
+# Overrides from NVIDIA Riva's new-language tokenizer-extension notebook.
+# Remaining defaults come from upstream/fastconformer_transducer_bpe_streaming_prompt.yaml.
+model:
+  train_ds:
+    default_prompt_mode: langID
+    batch_duration: 200
+  optim:
+    name: adamw
+    lr: 2.0
+    weight_decay: 0.001
+    sched:
+      d_model: 1024
+      warmup_steps: 2000
+  tokenizer:
+    update_tokenizer: true
+  char_labels:
+    update_labels: false
+trainer:
+  devices: 1
+  max_steps: 2000
+  limit_train_batches: 200
+  check_val_every_n_epoch: 20
+  accumulate_grad_batches: 4
+  log_every_n_steps: 100
+  precision: bf16
+exp_manager:
+  version: test
+  use_datetime_version: false

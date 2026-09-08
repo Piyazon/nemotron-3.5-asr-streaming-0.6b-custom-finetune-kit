@@ -18,9 +18,8 @@ from pathlib import Path
 
 DATASET_IDS = (
     "piyazon/cv-corpus-ug-24-latn",
-    "piyazon/thuyg20-datasets",
 )
-# Both repositories provide Arabic-script Uyghur in `sentence`.
+# Use Common Voice's Arabic-script transcripts, preserving their punctuation.
 TEXT_COLUMN = "sentence"
 
 LANGUAGE = "ug-CN"
@@ -290,7 +289,7 @@ def export_split(
 
 
 def select_splits(dataset, dataset_id):
-    """Preserve each source's held-out split before combining repositories."""
+    """Preserve the source's held-out split before exporting manifests."""
     if "train" not in dataset:
         raise RuntimeError(f"{dataset_id}: dataset has no train split")
     if "validation" in dataset:
@@ -410,8 +409,8 @@ def main():
             totals[role] = [a + b for a, b in zip(totals[role], stats)]
         del dataset
 
-    # Keep the current training manifests intact if either source fails to load
-    # or export. Each final manifest contains both repositories, once each.
+    # Publish only after every selected split exports successfully. Replace the
+    # old manifests so previously included datasets cannot remain in training.
     merge_manifests(manifests["train"], train_manifest)
     merge_manifests(manifests["test"], test_manifest)
     train_stats, test_stats = totals["train"], totals["test"]

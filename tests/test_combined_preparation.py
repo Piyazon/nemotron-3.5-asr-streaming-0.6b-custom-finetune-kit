@@ -1,4 +1,4 @@
-"""Check dataset merging and Arabic transcript selection without downloads."""
+"""Check Common Voice preparation and Arabic transcript selection without downloads."""
 
 import json
 from pathlib import Path
@@ -28,7 +28,7 @@ class FakeSplit:
         return self
 
 
-class CombinedPreparationTests(unittest.TestCase):
+class CommonVoicePreparationTests(unittest.TestCase):
     def test_preserves_official_source_splits(self):
         train, test, validation = FakeSplit(), FakeSplit("test"), FakeSplit("validation")
         self.assertEqual(prepare.select_splits({"train": train, "test": test}, "source"),
@@ -54,7 +54,7 @@ class CombinedPreparationTests(unittest.TestCase):
     def test_exports_from_different_sources_cannot_share_audio_paths(self):
         with tempfile.TemporaryDirectory() as directory, patch("builtins.print"):
             source_paths = []
-            for index, source in enumerate(prepare.DATASET_IDS):
+            for index, source in enumerate(("example/source-one", "example/source-two")):
                 ds = FakeSplit()
                 prepare.export_split(ds, "train", Path(directory) / f"{index}.jsonl",
                                      directory, 1, 1, "flac", source)
@@ -70,11 +70,11 @@ class CombinedPreparationTests(unittest.TestCase):
                     patch.object(prepare, "decode_audio", return_value=(audio, 16000)), \
                     patch.object(prepare, "make_mono", side_effect=lambda samples: samples):
                 output = prepare.process_batch(
-                    {"audio": [object()], "sentence": ["مەن باردىم"], "sentence_latn": ["men bardim"]},
+                    {"audio": [object()], "sentence": ["مەن باردىم."], "sentence_latn": ["men bardim"]},
                     [0], "train", directory, "flac", prepare.DATASET_IDS[0],
                 )
             entry = json.loads(output["manifest_line"][0])
-            self.assertEqual(entry["text"], "مەن باردىم")
+            self.assertEqual(entry["text"], "مەن باردىم.")
             self.assertEqual([entry[key] for key in ("language", "lang", "target_lang")], ["ug-CN"] * 3)
             self.assertEqual(entry["source_dataset"], prepare.DATASET_IDS[0])
             self.assertTrue(Path(entry["audio_filepath"]).is_file())
@@ -92,8 +92,13 @@ class CombinedPreparationTests(unittest.TestCase):
             self.assertEqual(destination.read_text(), "original\n")
             self.assertEqual(list(root.glob("*.tmp")), [])
 
-    def test_main_combines_both_repositories_once_per_split(self):
+    def test_main_replaces_mixed_manifests_with_common_voice_only(self):
         with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "custom_asr_data"
+            output_dir.mkdir()
+            for split in ("train", "test"):
+                (output_dir / f"{split}_manifest.json").write_text(
+                    json.dumps({"source_dataset": "piyazon/thuyg20-datasets"}) + "\n")
             loader = Mock(side_effect=lambda source: {"train": FakeSplit(), "test": FakeSplit("test")})
 
             def export(ds, split, manifest, audio_dir, workers, batch_size, fmt, source, max_duration):
@@ -106,10 +111,10 @@ class CombinedPreparationTests(unittest.TestCase):
                     patch.object(prepare, "Path", side_effect=lambda path: Path(directory) / path), \
                     patch("sys.argv", [str(SCRIPT), "--workers", "1"]), patch("builtins.print"):
                 prepare.main()
-            self.assertEqual([call.args[0] for call in loader.call_args_list], list(prepare.DATASET_IDS))
+            loader.assert_called_once_with("piyazon/cv-corpus-ug-24-latn")
             for split in ("train", "test"):
                 rows = [json.loads(line) for line in (Path(directory) / f"custom_asr_data/{split}_manifest.json").read_text().splitlines()]
-                self.assertEqual([row["source_dataset"] for row in rows], list(prepare.DATASET_IDS))
+                self.assertEqual([row["source_dataset"] for row in rows], ["piyazon/cv-corpus-ug-24-latn"])
                 self.assertTrue(all(row["source_split"] == split for row in rows))
 
 
